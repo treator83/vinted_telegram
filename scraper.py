@@ -1,201 +1,187 @@
+"""Vinted search-page interaction and listing extraction."""
+
+from __future__ import annotations
+
+import logging
 import re
 import time
+from typing import Final
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import (
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 
-from webdriver_manager.chrome import ChromeDriverManager
-
-from config import HEADLESS
+from browser import Browser
 from models import Listing
+
+LOGGER = logging.getLogger(__name__)
+
+GRID_ITEM_SELECTOR: Final[str] = '[data-testid="grid-item"]'
+LISTING_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"product-item-id-(\d+)")
 
 
 class VintedScraper:
+    """Scrape Vinted listings through one reusable browser session."""
 
-    def __init__(self):
-        self.driver = None
-        self.wait = None
+    def __init__(self, browser: Browser | None = None) -> None:
+        self.browser = browser or Browser()
+        self._cookies_checked = False
 
-    def start(self):
-        options = Options()
+    @property
+    def driver(self):
+        """Expose the current Selenium driver for backward compatibility."""
+        return self.browser.driver
 
-        if HEADLESS:
-            options.add_argument("--headless=new")
+    @property
+    def wait(self):
+        """Expose the current wait helper for backward compatibility."""
+        return self.browser.wait
 
-        options.add_argument("--window-size=1600,1200")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-infobars")
-        options.add_argument("--start-maximized")
+    def start(self) -> None:
+        """Start the browser session."""
+        self.browser.start()
 
-        self.driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=options
-        )
+    def stop(self) -> None:
+        """Stop the browser session safely."""
+        self.browser.stop()
 
-        self.wait = WebDriverWait(self.driver, 20)
+    def open(self, url: str) -> None:
+        """Open a Vinted search URL using browser retry and recovery logic."""
+        self.browser.get(url)
 
-    def stop(self):
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
+    def accept_cookies(self) -> bool:
+        """Accept the Vinted cookie banner once per browser session.
 
-    def open(self, url):
-        print(f"\nOpening:\n{url}\n")
-
-        self.driver.get(url)
-
-        self.wait.until(
-            EC.presence_of_element_located(
-                (By.TAG_NAME, "body")
-            )
-        )
-
-        time.sleep(2)
-
-    def accept_cookies(self):
-        try:
-            buttons = self.driver.find_elements(By.TAG_NAME, "button")
-
-            for button in buttons:
-                try:
-                    text = button.text.strip().lower()
-
-                    if text == "accept all":
-                        self.driver.execute_script(
-                            "arguments[0].click();",
-                            button
-                        )
-
-                        print("✅ Cookies accepted")
-                        time.sleep(1)
-                        return
-
-                except Exception:
-                    pass
-
-            print("ℹ️ Cookie banner not found")
-
-        except Exception as e:
-            print("Cookie error:", e)
-
-    def fetch(self):
+        Returns ``True`` when a banner was accepted and ``False`` when no
+        matching banner was present.  The method avoids iterating through every
+        page button, which previously caused stale-element failures.
         """
-        Read all listings from the current Vinted page.
-        Returns a list of Listing objects.
-        """
+        if self._cookies_checked:
+            return False
 
-        self.wait.until(
-            EC.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, '[data-testid="grid-item"]')
-            )
+        selectors = (
+            'button[data-testid="accept-all"]',
+            '#onetrust-accept-btn-handler',
         )
 
-        cards = self.driver.find_elements(
-            By.CSS_SELECTOR,
-            '[data-testid="grid-item"]'
-        )
-
-        print(f"Found {len(cards)} listings")
-
-        listings = []
-
-        for card in cards:
-
+        for selector in selectors:
             try:
+                buttons = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for button in buttons:
+                    if self._click_if_visible(button):
+                        self._cookies_checked = True
+                        LOGGER.info("Cookie banner accepted")
+                        time.sleep(0.5)
+                        return True
+            except (StaleElementReferenceException, WebDriverException):
+                continue
 
-                html = card.get_attribute("innerHTML")
+        try:
+            xpath = (
+                "//button[translate(normalize-space(.), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')="
+                "'accept all']"
+            )
+            buttons = self.driver.find_elements(By.XPATH, xpath)
+            for button in buttons:
+                if self._click_if_visible(button):
+                    self._cookies_checked = True
+                    LOGGER.info("Cookie banner accepted")
+                    time.sleep(0.5)
+                    return True
+        except (StaleElementReferenceException, WebDriverException):
+            pass
 
-                # Listing ID
-                match = re.search(r'product-item-id-(\d+)', html)
+        self._cookies_checked = True
+        LOGGER.info("Cookie banner not present")
+        return False
 
-                if not match:
-                    continue
+    def fetch(self) -> list[Listing]:
+        """Return all parseable listings from the current search page."""
+        try:
+            self.wait.until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, GRID_ITEM_SELECTOR))
+            )
+        except TimeoutException:
+            LOGGER.warning("No listing cards appeared before the timeout")
+            return []
 
-                listing_id = match.group(1)
+        cards = self.driver.find_elements(By.CSS_SELECTOR, GRID_ITEM_SELECTOR)
+        LOGGER.info("Found %s listing cards", len(cards))
 
-                # Brand / title
-                title = ""
-
-                try:
-                    title = card.find_element(
-                        By.CSS_SELECTOR,
-                        '[data-testid$="description-title"]'
-                    ).text.strip()
-                except:
-                    pass
-
-                # Subtitle (size + condition)
-                subtitle = ""
-
-                try:
-                    subtitle = card.find_element(
-                        By.CSS_SELECTOR,
-                        '[data-testid$="description-subtitle"]'
-                    ).text.strip()
-                except:
-                    pass
-
-                # Price
-                price = ""
-
-                try:
-                    price = card.find_element(
-                        By.CSS_SELECTOR,
-                        '[data-testid$="price-text"]'
-                    ).text.strip()
-                except:
-                    pass
-
-                # Total price
-                total_price = ""
-
-                try:
-                    total_price = card.find_element(
-                        By.CSS_SELECTOR,
-                        '[data-testid="total-combined-price"]'
-                    ).text.strip()
-                except:
-                    pass
-
-                # URL
-                url = ""
-
-                try:
-                    url = card.find_element(
-                        By.CSS_SELECTOR,
-                        'a[href*="/items/"]'
-                    ).get_attribute("href")
-                except:
-                    pass
-
-                # Image
-                image = ""
-
-                try:
-                    image = card.find_element(
-                        By.TAG_NAME,
-                        "img"
-                    ).get_attribute("src")
-                except:
-                    pass
-
-                listings.append(
-                    Listing(
-                        id=listing_id,
-                        title=title,
-                        subtitle=subtitle,
-                        price=price,
-                        total_price=total_price,
-                        url=url,
-                        image=image
-                    )
-                )
-
-            except Exception as e:
-                print("Listing parse error:", e)
+        listings: list[Listing] = []
+        for card in cards:
+            try:
+                listing = self._parse_card(card)
+                if listing is not None:
+                    listings.append(listing)
+            except StaleElementReferenceException:
+                LOGGER.debug("Skipped a listing card that changed during parsing")
+            except WebDriverException as exc:
+                LOGGER.warning("Unable to parse a listing card: %s", exc)
+            except Exception:
+                LOGGER.exception("Unexpected listing parsing error")
 
         return listings
+
+    def _parse_card(self, card: WebElement) -> Listing | None:
+        listing_id = self._extract_listing_id(card)
+        if listing_id is None:
+            return None
+
+        return Listing(
+            id=listing_id,
+            title=self._text(card, '[data-testid$="description-title"]'),
+            subtitle=self._text(card, '[data-testid$="description-subtitle"]'),
+            price=self._text(card, '[data-testid$="price-text"]'),
+            total_price=self._text(card, '[data-testid="total-combined-price"]'),
+            url=self._attribute(card, 'a[href*="/items/"]', "href"),
+            image=self._attribute(card, "img", "src"),
+        )
+
+    @staticmethod
+    def _extract_listing_id(card: WebElement) -> str | None:
+        test_id = card.get_attribute("data-testid") or ""
+        match = LISTING_ID_PATTERN.search(test_id)
+
+        if match is None:
+            html = card.get_attribute("innerHTML") or ""
+            match = LISTING_ID_PATTERN.search(html)
+
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _text(card: WebElement, selector: str) -> str:
+        try:
+            return card.find_element(By.CSS_SELECTOR, selector).text.strip()
+        except WebDriverException:
+            return ""
+
+    @staticmethod
+    def _attribute(card: WebElement, selector: str, attribute: str) -> str:
+        try:
+            return (
+                card.find_element(By.CSS_SELECTOR, selector).get_attribute(attribute)
+                or ""
+            ).strip()
+        except WebDriverException:
+            return ""
+
+    def _click_if_visible(self, button: WebElement) -> bool:
+        try:
+            if not button.is_displayed() or not button.is_enabled():
+                return False
+
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});",
+                button,
+            )
+            self.driver.execute_script("arguments[0].click();", button)
+            return True
+        except (StaleElementReferenceException, WebDriverException):
+            return False
