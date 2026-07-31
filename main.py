@@ -1,152 +1,404 @@
+"""Long-running orchestration for Vinted Agent."""
+
+from __future__ import annotations
+
+import logging
+import math
+import signal
+import threading
 import time
+from dataclasses import dataclass
+from types import FrameType
+from typing import Final
 
 from config import CHECK_INTERVAL
 from database import Database
 from filters import allow
-from logger import Logger
 from scraper import VintedScraper
+from search import Search
 from search_manager import SearchManager
 from telegram_client import TelegramClient
 
+LOGGER = logging.getLogger(__name__)
 
-def run_once():
+SEPARATOR: Final[str] = "=" * 60
+SUB_SEPARATOR: Final[str] = "-" * 60
+PRICE_TOLERANCE: Final[float] = 0.005
+MINIMUM_CHECK_INTERVAL: Final[int] = 1
 
-    db = Database()
-    telegram = TelegramClient()
-    logger = Logger()
+STOP_EVENT = threading.Event()
 
-    searches = SearchManager().load()
 
-    scraper = VintedScraper()
+@dataclass(slots=True)
+class CycleStats:
+    """Statistics collected during one complete monitoring cycle."""
 
-    total_found = 0
-    total_new = 0
-    total_price_drops = 0
+    listings_found: int = 0
+    listings_filtered: int = 0
+    new_listings: int = 0
+    price_drops: int = 0
+    price_increases: int = 0
+    failed_listings: int = 0
+    failed_searches: int = 0
 
-    try:
 
-        logger.log("=" * 60)
-        logger.log("Starting Vinted Agent")
-        logger.log("=" * 60)
+class VintedAgent:
+    """Coordinate searches, scraping, persistence, and notifications."""
 
-        scraper.start()
+    def __init__(
+        self,
+        database: Database | None = None,
+        telegram: TelegramClient | None = None,
+        scraper: VintedScraper | None = None,
+        search_manager: SearchManager | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self.database = database or Database()
+        self.telegram = telegram or TelegramClient()
+        self.scraper = scraper or VintedScraper()
+        self.search_manager = search_manager or SearchManager()
+        self.stop_event = stop_event or threading.Event()
+
+        self._started = False
+        self._closed = False
+
+    def start(self) -> None:
+        """Start resources required by the monitoring service."""
+
+        if self._started:
+            return
+
+        LOGGER.info(SEPARATOR)
+        LOGGER.info("Starting Vinted Agent")
+        LOGGER.info(SEPARATOR)
+
+        self.scraper.start()
+        self._started = True
+
+    def run_forever(self) -> None:
+        """Run monitoring cycles until a shutdown signal is received."""
+
+        self.start()
+
+        interval = max(MINIMUM_CHECK_INTERVAL, int(CHECK_INTERVAL))
+
+        while not self.stop_event.is_set():
+            cycle_started = time.monotonic()
+
+            try:
+                self.run_cycle()
+            except Exception:
+                LOGGER.exception("Monitoring cycle failed")
+
+            if self.stop_event.is_set():
+                break
+
+            elapsed = time.monotonic() - cycle_started
+
+            LOGGER.info(
+                "Cycle completed in %.2f seconds; sleeping for %s seconds",
+                elapsed,
+                interval,
+            )
+
+            self.stop_event.wait(interval)
+
+        LOGGER.info("Vinted Agent shutdown requested")
+
+    def run_cycle(self) -> CycleStats:
+        """Execute one complete pass through all configured searches."""
+
+        if not self._started:
+            self.start()
+
+        stats = CycleStats()
+        searches = self.search_manager.load()
+
+        if not searches:
+            LOGGER.warning("No searches are configured")
+            return stats
+
+        LOGGER.info(SEPARATOR)
+        LOGGER.info("Starting monitoring cycle with %s searches", len(searches))
+        LOGGER.info(SEPARATOR)
 
         for search in searches:
+            if self.stop_event.is_set():
+                break
 
-            logger.log(f"Searching: {search.name}")
+            try:
+                self._process_search(search, stats)
+            except Exception:
+                stats.failed_searches += 1
+                LOGGER.exception("Search failed: %s", search.name)
 
-            scraper.open(search.url)
-            scraper.accept_cookies()
+            LOGGER.info(SUB_SEPARATOR)
 
-            listings = scraper.fetch()
+        self._log_cycle_summary(stats)
+        return stats
 
-            logger.log(f"Found {len(listings)} listings")
+    def close(self) -> None:
+        """Close all application resources safely."""
 
-            total_found += len(listings)
+        if self._closed:
+            return
 
-            search_new = 0
+        self._closed = True
 
-            for listing in listings:
+        try:
+            self.scraper.stop()
+        except Exception:
+            LOGGER.exception("Unable to stop the scraper cleanly")
 
-                listing.search_id = search.id
-                listing.search_name = search.name
+        try:
+            self.telegram.close()
+        except Exception:
+            LOGGER.exception("Unable to close Telegram client cleanly")
 
-                if not allow(listing, search):
-                    continue
+        try:
+            self.database.close()
+        except Exception:
+            LOGGER.exception("Unable to close the database cleanly")
 
-                existing = db.get(listing.id)
+        LOGGER.info("Vinted Agent stopped")
 
-                # ------------------------
-                # Brand new listing
-                # ------------------------
+    def __enter__(self) -> VintedAgent:
+        self.start()
+        return self
 
-                if existing is None:
+    def __exit__(
+        self,
+        exc_type: object,
+        exc: object,
+        traceback: object,
+    ) -> None:
+        self.close()
 
-                    db.save(listing)
+    def _process_search(
+        self,
+        search: Search,
+        stats: CycleStats,
+    ) -> None:
+        LOGGER.info("Searching: %s", search.name)
 
-                    telegram.send_listing(listing)
+        self.scraper.open(search.url)
+        self.scraper.accept_cookies()
 
-                    logger.log(
-                        f"NEW | {search.name} | {listing.title} | {listing.price}"
-                    )
+        listings = self.scraper.fetch()
+        search_new = 0
 
-                    total_new += 1
+        stats.listings_found += len(listings)
+
+        LOGGER.info("Found %s listings", len(listings))
+
+        for listing in listings:
+            if self.stop_event.is_set():
+                break
+
+            listing.search_id = str(search.id)
+            listing.search_name = search.name
+
+            if not allow(listing, search):
+                stats.listings_filtered += 1
+                continue
+
+            try:
+                if self._process_listing(listing, stats):
                     search_new += 1
+            except Exception:
+                stats.failed_listings += 1
+                LOGGER.exception(
+                    "Unable to process listing %s from search %s",
+                    listing.id,
+                    search.name,
+                )
 
-                    continue
+        LOGGER.info("New listings: %s", search_new)
 
-                # ------------------------
-                # Existing listing
-                # ------------------------
+    def _process_listing(
+        self,
+        listing,
+        stats: CycleStats,
+    ) -> bool:
+        existing = self.database.get(listing.id)
 
-                db.touch(listing.id)
+        if existing is None:
+            inserted = self.database.save(listing)
 
-                old_price = existing["current_price"]
+            if not inserted:
+                return False
 
-                if old_price is None:
-                    old_price = listing.price_value
+            notification_sent = self.telegram.send_listing(listing)
 
-                # ------------------------
-                # Price drop
-                # ------------------------
+            if not notification_sent:
+                LOGGER.warning(
+                    "New-listing notification failed for %s",
+                    listing.id,
+                )
 
-                if listing.price_value < old_price:
+            LOGGER.info(
+                "NEW | %s | %s | %s",
+                listing.search_name,
+                listing.title,
+                listing.price,
+            )
 
-                    db.update_price(listing)
+            stats.new_listings += 1
+            return True
 
-                    telegram.send_price_drop(
-                        listing,
-                        old_price
-                    )
+        old_price = self._stored_price(
+            existing["current_price"],
+            fallback=listing.price_value,
+        )
 
-                    logger.log(
-                        f"PRICE DROP | {search.name} | "
-                        f"{old_price:.2f} -> {listing.price_value:.2f}"
-                    )
+        price_difference = listing.price_value - old_price
 
-                    total_price_drops += 1
+        if price_difference < -PRICE_TOLERANCE:
+            self.database.update_price(listing)
 
-                # ------------------------
-                # Price changed (up)
-                # ------------------------
+            notification_sent = self.telegram.send_price_drop(
+                listing,
+                old_price,
+            )
 
-                elif listing.price_value > old_price:
+            if not notification_sent:
+                LOGGER.warning(
+                    "Price-drop notification failed for %s",
+                    listing.id,
+                )
 
-                    db.update_price(listing)
+            LOGGER.info(
+                "PRICE DROP | %s | %.2f -> %.2f",
+                listing.search_name,
+                old_price,
+                listing.price_value,
+            )
 
-                    logger.log(
-                        f"PRICE UPDATE | {search.name} | "
-                        f"{old_price:.2f} -> {listing.price_value:.2f}"
-                    )
+            stats.price_drops += 1
+            return False
 
-            logger.log(f"New listings: {search_new}")
-            logger.log("-" * 60)
+        if price_difference > PRICE_TOLERANCE:
+            self.database.update_price(listing)
 
-        logger.log(f"Listings checked : {total_found}")
-        logger.log(f"New listings     : {total_new}")
-        logger.log(f"Price drops      : {total_price_drops}")
-        logger.log(f"Database size    : {db.count()}")
+            LOGGER.info(
+                "PRICE UPDATE | %s | %.2f -> %.2f",
+                listing.search_name,
+                old_price,
+                listing.price_value,
+            )
 
-        logger.log("=" * 60)
+            stats.price_increases += 1
+            return False
 
-    except Exception as e:
+        self.database.touch(listing.id)
+        return False
 
-        logger.log(f"ERROR: {e}")
+    def _log_cycle_summary(self, stats: CycleStats) -> None:
+        try:
+            database_size = self.database.count()
+        except Exception:
+            database_size = -1
+            LOGGER.exception("Unable to read database size")
+
+        LOGGER.info(SEPARATOR)
+        LOGGER.info("Listings found    : %s", stats.listings_found)
+        LOGGER.info("Listings filtered : %s", stats.listings_filtered)
+        LOGGER.info("New listings      : %s", stats.new_listings)
+        LOGGER.info("Price drops       : %s", stats.price_drops)
+        LOGGER.info("Price increases   : %s", stats.price_increases)
+        LOGGER.info("Failed listings   : %s", stats.failed_listings)
+        LOGGER.info("Failed searches   : %s", stats.failed_searches)
+
+        if database_size >= 0:
+            LOGGER.info("Database size     : %s", database_size)
+
+        LOGGER.info(SEPARATOR)
+
+    @staticmethod
+    def _stored_price(
+        value: object,
+        fallback: float,
+    ) -> float:
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+        if not math.isfinite(price):
+            return fallback
+
+        return price
+
+
+def configure_logging() -> None:
+    """Configure console logging for development and systemd."""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def install_signal_handlers() -> None:
+    """Handle Ctrl+C and systemd termination gracefully."""
+
+    def handle_shutdown(
+        signum: int,
+        frame: FrameType | None,
+    ) -> None:
+        del frame
+
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = str(signum)
+
+        LOGGER.info("Received %s; stopping after current operation", signal_name)
+        STOP_EVENT.set()
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+
+def run_once() -> CycleStats:
+    """Run one monitoring cycle and close all resources afterward."""
+
+    agent = VintedAgent(stop_event=STOP_EVENT)
+
+    try:
+        agent.start()
+        return agent.run_cycle()
+    finally:
+        agent.close()
+
+
+def main() -> int:
+    """Run Vinted Agent as a long-lived service."""
+
+    configure_logging()
+    install_signal_handlers()
+
+    agent: VintedAgent | None = None
+
+    try:
+        agent = VintedAgent(stop_event=STOP_EVENT)
+        agent.run_forever()
+        return 0
+
+    except KeyboardInterrupt:
+        STOP_EVENT.set()
+        LOGGER.info("Interrupted by user")
+        return 0
+
+    except Exception:
+        LOGGER.exception("Fatal Vinted Agent error")
+        return 1
 
     finally:
-
-        scraper.stop()
-        db.close()
+        if agent is not None:
+            agent.close()
 
 
 if __name__ == "__main__":
-
-    while True:
-
-        run_once()
-
-        print()
-        print(f"Sleeping {CHECK_INTERVAL} seconds...")
-        print()
-
-        time.sleep(CHECK_INTERVAL)
+    raise SystemExit(main())
