@@ -1,46 +1,35 @@
 [
-    {
-        "id": "rst_boots",
-        "name": "RST Boots",
-
-        "url": "https://www.vinted.co.uk/catalog?search_text=RST%20boots&order=newest_first&page=1",
-
-        "max_price": 80,
-
-        "keywords": [
-            "rst"
-        ],
-
-        "sizes": [
-            "9",
-            "10"
-        ],
-
-        "conditions": [
-            "Very Good",
-            "Good"
-        ]
-    },
-
-    {
-        "id": "alpinestars_boots",
-        "name": "Alpinestars Boots",
-
-        "url": "https://www.vinted.co.uk/catalog?search_text=alpinestars%20boots&order=newest_first&page=1",
-
-        "max_price": 120,
-
-        "keywords": [
-            "alpinestars"
-        ],
-
-        "sizes": [
-            "9"
-        ],
-
-        "conditions": [
-            "Very Good",
-            "Good"
-        ]
-    }
+  {
+    "id": "rst_boots",
+    "name": "RST Boots",
+    "url": "https://www.vinted.co.uk/catalog?search_text=RST%20boots&order=newest_first&page=1",
+    "max_price": 80,
+    "keywords": [
+      "rst"
+    ],
+    "sizes": [
+      "9",
+      "10"
+    ],
+    "conditions": [
+      "Very Good",
+      "Good"
+    ]
+  },
+  {
+    "id": "alpinestars_boots",
+    "name": "Alpinestars Boots",
+    "url": "https://www.vinted.co.uk/catalog?search_text=alpinestars%20boots&order=newest_first&page=1",
+    "max_price": 120,
+    "keywords": [
+      "alpinestars"
+    ],
+    "sizes": [
+      "9"
+    ],
+    "conditions": [
+      "Very Good",
+      "Good"
+    ]
+  }
 ]
