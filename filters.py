@@ -1,62 +1,95 @@
-def allow(listing, search):
-    """
-    Returns True if the listing passes all filters
-    defined for the search.
-    """
+"""Filtering rules for Vinted listings."""
 
-    # ----------------------------------
-    # Keyword filter
-    # ----------------------------------
+from __future__ import annotations
 
-    if search.keywords:
+import re
+from functools import lru_cache
+from typing import Iterable
 
-        text = f"{listing.title} {listing.subtitle}".lower()
+from models import Listing
+from search import Search
 
-        keywords = [
-            keyword.lower()
-            for keyword in search.keywords
-        ]
 
-        if not any(keyword in text for keyword in keywords):
-            return False
+def allow(listing: Listing, search: Search) -> bool:
+    """Return whether a listing passes every filter configured for a search."""
 
-    # ----------------------------------
-    # Maximum price
-    # ----------------------------------
+    combined_text = _normalise_text(
+        f"{listing.title} {listing.subtitle}"
+    )
+    subtitle = _normalise_text(listing.subtitle)
 
-    if listing.price_value > search.max_price:
+    if search.keywords and not _contains_any_phrase(
+        combined_text,
+        search.keywords,
+    ):
         return False
 
-    # ----------------------------------
-    # Size filter
-    # ----------------------------------
+    if (
+        search.max_price is not None
+        and listing.price_value > float(search.max_price)
+    ):
+        return False
 
-    if search.sizes:
+    if search.sizes and not _contains_any_exact_value(
+        subtitle,
+        search.sizes,
+    ):
+        return False
 
-        subtitle = listing.subtitle.lower()
-
-        sizes = [
-            str(size).lower()
-            for size in search.sizes
-        ]
-
-        if not any(size in subtitle for size in sizes):
-            return False
-
-    # ----------------------------------
-    # Condition filter
-    # ----------------------------------
-
-    if search.conditions:
-
-        subtitle = listing.subtitle.lower()
-
-        conditions = [
-            condition.lower()
-            for condition in search.conditions
-        ]
-
-        if not any(condition in subtitle for condition in conditions):
-            return False
+    if search.conditions and not _contains_any_phrase(
+        subtitle,
+        search.conditions,
+    ):
+        return False
 
     return True
+
+
+def _contains_any_phrase(
+    text: str,
+    values: Iterable[object],
+) -> bool:
+    """Return whether normalised text contains any non-empty phrase."""
+
+    return any(
+        phrase in text
+        for value in values
+        if (phrase := _normalise_text(value))
+    )
+
+
+def _contains_any_exact_value(
+    text: str,
+    values: Iterable[object],
+) -> bool:
+    """Match values using boundaries to avoid partial size matches.
+
+    For example, size ``4`` will not match ``44`` and size ``L`` will not
+    match a word such as ``excellent``.
+    """
+
+    return any(
+        _value_pattern(_normalise_text(value)).search(text) is not None
+        for value in values
+        if _normalise_text(value)
+    )
+
+
+@lru_cache(maxsize=256)
+def _value_pattern(value: str) -> re.Pattern[str]:
+    escaped = re.escape(value).replace(r"\ ", r"\s+")
+
+    return re.compile(
+        rf"(?<![a-z0-9]){escaped}(?![a-z0-9])",
+        flags=re.IGNORECASE,
+    )
+
+
+def _normalise_text(value: object | None) -> str:
+    """Convert a value to consistent text for case-insensitive matching."""
+
+    return " ".join(
+        str(value or "")
+        .casefold()
+        .split()
+    )
