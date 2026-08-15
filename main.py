@@ -14,6 +14,8 @@ from typing import Final
 from config import CHECK_INTERVAL
 from database import Database
 from filters import allow
+from logger import configure_logging
+from models import Listing
 from scraper import VintedScraper
 from search import Search
 from search_manager import SearchManager
@@ -76,11 +78,14 @@ class VintedAgent:
         self._started = True
 
     def run_forever(self) -> None:
-        """Run monitoring cycles until a shutdown signal is received."""
+        """Run monitoring cycles until shutdown is requested."""
 
         self.start()
 
-        interval = max(MINIMUM_CHECK_INTERVAL, int(CHECK_INTERVAL))
+        interval = max(
+            MINIMUM_CHECK_INTERVAL,
+            int(CHECK_INTERVAL),
+        )
 
         while not self.stop_event.is_set():
             cycle_started = time.monotonic()
@@ -119,7 +124,10 @@ class VintedAgent:
             return stats
 
         LOGGER.info(SEPARATOR)
-        LOGGER.info("Starting monitoring cycle with %s searches", len(searches))
+        LOGGER.info(
+            "Starting monitoring cycle with %s searches",
+            len(searches),
+        )
         LOGGER.info(SEPARATOR)
 
         for search in searches:
@@ -127,14 +135,21 @@ class VintedAgent:
                 break
 
             try:
-                self._process_search(search, stats)
+                self._process_search(
+                    search,
+                    stats,
+                )
             except Exception:
                 stats.failed_searches += 1
-                LOGGER.exception("Search failed: %s", search.name)
+                LOGGER.exception(
+                    "Search failed: %s",
+                    search.name,
+                )
 
             LOGGER.info(SUB_SEPARATOR)
 
         self._log_cycle_summary(stats)
+
         return stats
 
     def close(self) -> None:
@@ -148,17 +163,23 @@ class VintedAgent:
         try:
             self.scraper.stop()
         except Exception:
-            LOGGER.exception("Unable to stop the scraper cleanly")
+            LOGGER.exception(
+                "Unable to stop scraper cleanly"
+            )
 
         try:
             self.telegram.close()
         except Exception:
-            LOGGER.exception("Unable to close Telegram client cleanly")
+            LOGGER.exception(
+                "Unable to close Telegram client cleanly"
+            )
 
         try:
             self.database.close()
         except Exception:
-            LOGGER.exception("Unable to close the database cleanly")
+            LOGGER.exception(
+                "Unable to close database cleanly"
+            )
 
         LOGGER.info("Vinted Agent stopped")
 
@@ -179,17 +200,24 @@ class VintedAgent:
         search: Search,
         stats: CycleStats,
     ) -> None:
-        LOGGER.info("Searching: %s", search.name)
+        LOGGER.info(
+            "Searching: %s",
+            search.name,
+        )
 
         self.scraper.open(search.url)
         self.scraper.accept_cookies()
 
         listings = self.scraper.fetch()
-        search_new = 0
 
         stats.listings_found += len(listings)
 
-        LOGGER.info("Found %s listings", len(listings))
+        LOGGER.info(
+            "Found %s listings",
+            len(listings),
+        )
+
+        search_new = 0
 
         for listing in listings:
             if self.stop_event.is_set():
@@ -203,32 +231,48 @@ class VintedAgent:
                 continue
 
             try:
-                if self._process_listing(listing, stats):
+                if self._process_listing(
+                    listing,
+                    stats,
+                ):
                     search_new += 1
+
             except Exception:
                 stats.failed_listings += 1
+
                 LOGGER.exception(
                     "Unable to process listing %s from search %s",
                     listing.id,
                     search.name,
                 )
 
-        LOGGER.info("New listings: %s", search_new)
+        LOGGER.info(
+            "New listings: %s",
+            search_new,
+        )
 
     def _process_listing(
         self,
-        listing,
+        listing: Listing,
         stats: CycleStats,
     ) -> bool:
-        existing = self.database.get(listing.id)
+        existing = self.database.get(
+            listing.id
+        )
 
         if existing is None:
-            inserted = self.database.save(listing)
+            inserted = self.database.save(
+                listing
+            )
 
             if not inserted:
                 return False
 
-            notification_sent = self.telegram.send_listing(listing)
+            notification_sent = (
+                self.telegram.send_listing(
+                    listing
+                )
+            )
 
             if not notification_sent:
                 LOGGER.warning(
@@ -244,6 +288,7 @@ class VintedAgent:
             )
 
             stats.new_listings += 1
+
             return True
 
         old_price = self._stored_price(
@@ -251,14 +296,20 @@ class VintedAgent:
             fallback=listing.price_value,
         )
 
-        price_difference = listing.price_value - old_price
+        price_difference = (
+            listing.price_value - old_price
+        )
 
         if price_difference < -PRICE_TOLERANCE:
-            self.database.update_price(listing)
+            self.database.update_price(
+                listing
+            )
 
-            notification_sent = self.telegram.send_price_drop(
-                listing,
-                old_price,
+            notification_sent = (
+                self.telegram.send_price_drop(
+                    listing,
+                    old_price,
+                )
             )
 
             if not notification_sent:
@@ -275,10 +326,13 @@ class VintedAgent:
             )
 
             stats.price_drops += 1
+
             return False
 
         if price_difference > PRICE_TOLERANCE:
-            self.database.update_price(listing)
+            self.database.update_price(
+                listing
+            )
 
             LOGGER.info(
                 "PRICE UPDATE | %s | %.2f -> %.2f",
@@ -288,29 +342,64 @@ class VintedAgent:
             )
 
             stats.price_increases += 1
+
             return False
 
-        self.database.touch(listing.id)
+        self.database.touch(
+            listing.id
+        )
+
         return False
 
-    def _log_cycle_summary(self, stats: CycleStats) -> None:
+    def _log_cycle_summary(
+        self,
+        stats: CycleStats,
+    ) -> None:
         try:
-            database_size = self.database.count()
+            database_size = (
+                self.database.count()
+            )
         except Exception:
             database_size = -1
-            LOGGER.exception("Unable to read database size")
+            LOGGER.exception(
+                "Unable to read database size"
+            )
 
         LOGGER.info(SEPARATOR)
-        LOGGER.info("Listings found    : %s", stats.listings_found)
-        LOGGER.info("Listings filtered : %s", stats.listings_filtered)
-        LOGGER.info("New listings      : %s", stats.new_listings)
-        LOGGER.info("Price drops       : %s", stats.price_drops)
-        LOGGER.info("Price increases   : %s", stats.price_increases)
-        LOGGER.info("Failed listings   : %s", stats.failed_listings)
-        LOGGER.info("Failed searches   : %s", stats.failed_searches)
+        LOGGER.info(
+            "Listings found    : %s",
+            stats.listings_found,
+        )
+        LOGGER.info(
+            "Listings filtered : %s",
+            stats.listings_filtered,
+        )
+        LOGGER.info(
+            "New listings      : %s",
+            stats.new_listings,
+        )
+        LOGGER.info(
+            "Price drops       : %s",
+            stats.price_drops,
+        )
+        LOGGER.info(
+            "Price increases   : %s",
+            stats.price_increases,
+        )
+        LOGGER.info(
+            "Failed listings   : %s",
+            stats.failed_listings,
+        )
+        LOGGER.info(
+            "Failed searches   : %s",
+            stats.failed_searches,
+        )
 
         if database_size >= 0:
-            LOGGER.info("Database size     : %s", database_size)
+            LOGGER.info(
+                "Database size     : %s",
+                database_size,
+            )
 
         LOGGER.info(SEPARATOR)
 
@@ -330,16 +419,6 @@ class VintedAgent:
         return price
 
 
-def configure_logging() -> None:
-    """Configure console logging for development and systemd."""
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-
 def install_signal_handlers() -> None:
     """Handle Ctrl+C and systemd termination gracefully."""
 
@@ -350,21 +429,36 @@ def install_signal_handlers() -> None:
         del frame
 
         try:
-            signal_name = signal.Signals(signum).name
+            signal_name = signal.Signals(
+                signum
+            ).name
         except ValueError:
             signal_name = str(signum)
 
-        LOGGER.info("Received %s; stopping after current operation", signal_name)
+        LOGGER.info(
+            "Received %s; shutting down",
+            signal_name,
+        )
+
         STOP_EVENT.set()
 
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(
+        signal.SIGINT,
+        handle_shutdown,
+    )
+
+    signal.signal(
+        signal.SIGTERM,
+        handle_shutdown,
+    )
 
 
 def run_once() -> CycleStats:
-    """Run one monitoring cycle and close all resources afterward."""
+    """Run one monitoring cycle and close resources afterward."""
 
-    agent = VintedAgent(stop_event=STOP_EVENT)
+    agent = VintedAgent(
+        stop_event=STOP_EVENT
+    )
 
     try:
         agent.start()
@@ -382,17 +476,28 @@ def main() -> int:
     agent: VintedAgent | None = None
 
     try:
-        agent = VintedAgent(stop_event=STOP_EVENT)
+        agent = VintedAgent(
+            stop_event=STOP_EVENT
+        )
+
         agent.run_forever()
+
         return 0
 
     except KeyboardInterrupt:
         STOP_EVENT.set()
-        LOGGER.info("Interrupted by user")
+
+        LOGGER.info(
+            "Interrupted by user"
+        )
+
         return 0
 
     except Exception:
-        LOGGER.exception("Fatal Vinted Agent error")
+        LOGGER.exception(
+            "Fatal Vinted Agent error"
+        )
+
         return 1
 
     finally:
