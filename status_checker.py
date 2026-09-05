@@ -1,7 +1,8 @@
-"""Check whether stored Vinted listings are active, sold, or unavailable."""
+"""Check whether stored Vinted listings are active or sold."""
 
 from __future__ import annotations
 
+import io
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
@@ -11,9 +12,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
 LOGGER = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT: Final[tuple[int, int]] = (10, 30)
+REQUEST_TIMEOUT: Final[tuple[int, int]] = (
+    10,
+    30,
+)
 
 USER_AGENT: Final[str] = (
     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -23,33 +28,51 @@ USER_AGENT: Final[str] = (
 
 
 class ListingStatus(StrEnum):
-    """Known availability states for a stored Vinted listing."""
+    """Known availability states for a Vinted listing."""
 
     ACTIVE = "active"
     SOLD = "sold"
+
+    # Kept for compatibility with existing code/database.
+    # New HTTP 404/410 responses are now treated as SOLD.
     NOT_FOUND = "not_found"
+
     UNKNOWN = "unknown"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+)
 class StatusResult:
-    """Result of checking one Vinted listing URL."""
+    """Result of checking one Vinted listing."""
 
     status: ListingStatus
     http_status: int | None = None
 
 
 class ListingStatusChecker:
-    """Check Vinted item pages without opening additional Selenium tabs."""
+    """Check Vinted listing availability using HTTP."""
 
     def __init__(self) -> None:
         self._session = self._create_session()
 
-    def check(self, url: str) -> StatusResult:
-        """Return the current availability state of a Vinted listing."""
+    def check(
+        self,
+        url: str,
+    ) -> StatusResult:
+        """
+        Check the current state of one listing.
+
+        Important project rule:
+
+        HTTP 404 and HTTP 410 are treated as SOLD.
+        """
 
         if not url or not url.strip():
-            return StatusResult(ListingStatus.UNKNOWN)
+            return StatusResult(
+                ListingStatus.UNKNOWN
+            )
 
         try:
             response = self._session.get(
@@ -57,36 +80,57 @@ class ListingStatusChecker:
                 headers={
                     "User-Agent": USER_AGENT,
                     "Accept": (
-                        "text/html,application/xhtml+xml,"
-                        "application/xml;q=0.9,image/avif,"
-                        "image/webp,*/*;q=0.8"
+                        "text/html,"
+                        "application/xhtml+xml,"
+                        "application/xml;q=0.9,"
+                        "image/avif,"
+                        "image/webp,"
+                        "*/*;q=0.8"
                     ),
-                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Accept-Language": (
+                        "en-GB,en;q=0.9"
+                    ),
                 },
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
+
         except requests.RequestException as exc:
             LOGGER.warning(
-                "Unable to check listing status for %s: %s",
+                "Unable to check listing status "
+                "for %s: %s",
                 url,
                 exc,
             )
-            return StatusResult(ListingStatus.UNKNOWN)
+
+            return StatusResult(
+                ListingStatus.UNKNOWN
+            )
 
         http_status = response.status_code
 
-        if http_status in {404, 410}:
-            LOGGER.debug("Listing not found: %s", url)
+        # Project rule:
+        # unavailable Vinted item pages count as sold.
+        if http_status in {
+            404,
+            410,
+        }:
+            LOGGER.info(
+                "Listing unavailable (HTTP %s); "
+                "treating as SOLD | %s",
+                http_status,
+                url,
+            )
 
             return StatusResult(
-                ListingStatus.NOT_FOUND,
+                ListingStatus.SOLD,
                 http_status=http_status,
             )
 
         if http_status != 200:
             LOGGER.warning(
-                "Unexpected HTTP %s while checking %s",
+                "Unexpected HTTP %s while "
+                "checking %s",
                 http_status,
                 url,
             )
@@ -96,7 +140,9 @@ class ListingStatusChecker:
                 http_status=http_status,
             )
 
-        status = self._detect_status(response.text)
+        status = self._detect_status(
+            response.text
+        )
 
         LOGGER.debug(
             "Listing status: %s | %s",
@@ -114,7 +160,9 @@ class ListingStatusChecker:
 
         self._session.close()
 
-    def __enter__(self) -> ListingStatusChecker:
+    def __enter__(
+        self,
+    ) -> ListingStatusChecker:
         return self
 
     def __exit__(
@@ -126,13 +174,18 @@ class ListingStatusChecker:
         self.close()
 
     @staticmethod
-    def _detect_status(html: str) -> ListingStatus:
-        """Detect listing status from Vinted's public item page."""
+    def _detect_status(
+        html: str,
+    ) -> ListingStatus:
+        """Detect availability from Vinted HTML."""
 
         content = html.casefold()
 
-        # Next.js data may escape URL slashes.
-        content = content.replace("\\/", "/")
+        # Vinted/Next.js may escape slashes.
+        content = content.replace(
+            "\\/",
+            "/",
+        )
 
         sold_signals = (
             "schema.org/outofstock",
@@ -140,7 +193,10 @@ class ListingStatusChecker:
             '\\"is_sold\\":true',
         )
 
-        if any(signal in content for signal in sold_signals):
+        if any(
+            signal in content
+            for signal in sold_signals
+        ):
             return ListingStatus.SOLD
 
         active_signals = (
@@ -150,13 +206,18 @@ class ListingStatusChecker:
             '\\"is_sold\\":false',
         )
 
-        if any(signal in content for signal in active_signals):
+        if any(
+            signal in content
+            for signal in active_signals
+        ):
             return ListingStatus.ACTIVE
 
         return ListingStatus.UNKNOWN
 
     @staticmethod
     def _create_session() -> requests.Session:
+        """Create reusable requests session."""
+
         session = requests.Session()
 
         retry_policy = Retry(
@@ -172,7 +233,11 @@ class ListingStatusChecker:
                 503,
                 504,
             ),
-            allowed_methods=frozenset({"GET"}),
+            allowed_methods=frozenset(
+                {
+                    "GET",
+                }
+            ),
             respect_retry_after_header=True,
         )
 
@@ -182,7 +247,14 @@ class ListingStatusChecker:
             pool_maxsize=4,
         )
 
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
+        session.mount(
+            "https://",
+            adapter,
+        )
+
+        session.mount(
+            "http://",
+            adapter,
+        )
 
         return session
