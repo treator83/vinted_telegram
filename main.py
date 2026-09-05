@@ -1,17 +1,14 @@
-"""Long-running orchestration for Vinted Agent."""
+"""Main entry point for Vinted Agent."""
 
 from __future__ import annotations
 
 import logging
-import math
 import signal
 import threading
 import time
 from dataclasses import dataclass
-from types import FrameType
-from typing import Final
 
-from config import CHECK_INTERVAL
+from config import CHECK_INTERVAL, DATABASE_PATH
 from database import Database
 from filters import allow
 from logger import configure_logging
@@ -19,119 +16,127 @@ from models import Listing
 from scraper import VintedScraper
 from search import Search
 from search_manager import SearchManager
+from status_checker import ListingStatus, ListingStatusChecker
 from telegram_client import TelegramClient
+
 
 LOGGER = logging.getLogger(__name__)
 
-SEPARATOR: Final[str] = "=" * 60
-SUB_SEPARATOR: Final[str] = "-" * 60
-PRICE_TOLERANCE: Final[float] = 0.005
-MINIMUM_CHECK_INTERVAL: Final[int] = 1
-
 STOP_EVENT = threading.Event()
+
+PRICE_TOLERANCE = 0.005
+
+# Number of stored listings checked directly on Vinted
+# after each normal catalogue monitoring cycle.
+STATUS_CHECK_BATCH_SIZE = 10
+
+# Small delay between direct item-page checks to reduce load
+# and avoid sending many requests to Vinted at once.
+STATUS_CHECK_DELAY = 1.0
 
 
 @dataclass(slots=True)
 class CycleStats:
-    """Statistics collected during one complete monitoring cycle."""
+    """Statistics collected during one monitoring cycle."""
 
     listings_found: int = 0
     listings_filtered: int = 0
+
     new_listings: int = 0
+
     price_drops: int = 0
     price_increases: int = 0
+
     failed_listings: int = 0
     failed_searches: int = 0
 
+    status_checks: int = 0
+    sold_detected: int = 0
+    unavailable_detected: int = 0
+    status_failures: int = 0
+
 
 class VintedAgent:
-    """Coordinate searches, scraping, persistence, and notifications."""
+    """Long-running Vinted monitoring service."""
 
-    def __init__(
-        self,
-        database: Database | None = None,
-        telegram: TelegramClient | None = None,
-        scraper: VintedScraper | None = None,
-        search_manager: SearchManager | None = None,
-        stop_event: threading.Event | None = None,
-    ) -> None:
-        self.database = database or Database()
-        self.telegram = telegram or TelegramClient()
-        self.scraper = scraper or VintedScraper()
-        self.search_manager = search_manager or SearchManager()
-        self.stop_event = stop_event or threading.Event()
+    def __init__(self) -> None:
+        self.database = Database(DATABASE_PATH)
+        self.scraper = VintedScraper()
+        self.telegram = TelegramClient()
+        self.search_manager = SearchManager()
+        self.status_checker = ListingStatusChecker()
 
-        self._started = False
-        self._closed = False
+        self.started = False
 
     def start(self) -> None:
-        """Start resources required by the monitoring service."""
+        """Start reusable application resources."""
 
-        if self._started:
+        if self.started:
             return
 
-        LOGGER.info(SEPARATOR)
+        LOGGER.info("=" * 60)
         LOGGER.info("Starting Vinted Agent")
-        LOGGER.info(SEPARATOR)
+        LOGGER.info("=" * 60)
 
         self.scraper.start()
-        self._started = True
+
+        self.started = True
 
     def run_forever(self) -> None:
-        """Run monitoring cycles until shutdown is requested."""
+        """Run monitoring cycles until shutdown."""
 
         self.start()
 
-        interval = max(
-            MINIMUM_CHECK_INTERVAL,
-            int(CHECK_INTERVAL),
-        )
-
-        while not self.stop_event.is_set():
+        while not STOP_EVENT.is_set():
             cycle_started = time.monotonic()
 
             try:
                 self.run_cycle()
+
             except Exception:
-                LOGGER.exception("Monitoring cycle failed")
+                LOGGER.exception(
+                    "Unexpected monitoring cycle failure"
+                )
 
-            if self.stop_event.is_set():
-                break
-
-            elapsed = time.monotonic() - cycle_started
-
-            LOGGER.info(
-                "Cycle completed in %.2f seconds; sleeping for %s seconds",
-                elapsed,
-                interval,
+            elapsed = (
+                time.monotonic() - cycle_started
             )
 
-            self.stop_event.wait(interval)
+            LOGGER.info(
+                "Cycle completed in %.2f seconds; "
+                "sleeping for %s seconds",
+                elapsed,
+                CHECK_INTERVAL,
+            )
 
-        LOGGER.info("Vinted Agent shutdown requested")
+            if STOP_EVENT.wait(CHECK_INTERVAL):
+                break
 
     def run_cycle(self) -> CycleStats:
-        """Execute one complete pass through all configured searches."""
-
-        if not self._started:
-            self.start()
+        """Run one complete monitoring cycle."""
 
         stats = CycleStats()
-        searches = self.search_manager.load()
 
-        if not searches:
-            LOGGER.warning("No searches are configured")
+        try:
+            searches = self.search_manager.load()
+
+        except Exception:
+            LOGGER.exception(
+                "Unable to load search configuration"
+            )
+
+            stats.failed_searches += 1
             return stats
 
-        LOGGER.info(SEPARATOR)
+        LOGGER.info("=" * 60)
         LOGGER.info(
-            "Starting monitoring cycle with %s searches",
+            "Starting monitoring cycle with %d searches",
             len(searches),
         )
-        LOGGER.info(SEPARATOR)
+        LOGGER.info("=" * 60)
 
         for search in searches:
-            if self.stop_event.is_set():
+            if STOP_EVENT.is_set():
                 break
 
             try:
@@ -139,116 +144,94 @@ class VintedAgent:
                     search,
                     stats,
                 )
+
             except Exception:
                 stats.failed_searches += 1
+
                 LOGGER.exception(
                     "Search failed: %s",
                     search.name,
                 )
 
-            LOGGER.info(SUB_SEPARATOR)
+            LOGGER.info("-" * 60)
 
-        self._log_cycle_summary(stats)
+        if not STOP_EVENT.is_set():
+            self._check_listing_statuses(
+                stats
+            )
+
+        self._log_cycle_summary(
+            stats
+        )
 
         return stats
-
-    def close(self) -> None:
-        """Close all application resources safely."""
-
-        if self._closed:
-            return
-
-        self._closed = True
-
-        try:
-            self.scraper.stop()
-        except Exception:
-            LOGGER.exception(
-                "Unable to stop scraper cleanly"
-            )
-
-        try:
-            self.telegram.close()
-        except Exception:
-            LOGGER.exception(
-                "Unable to close Telegram client cleanly"
-            )
-
-        try:
-            self.database.close()
-        except Exception:
-            LOGGER.exception(
-                "Unable to close database cleanly"
-            )
-
-        LOGGER.info("Vinted Agent stopped")
-
-    def __enter__(self) -> VintedAgent:
-        self.start()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: object,
-        exc: object,
-        traceback: object,
-    ) -> None:
-        self.close()
 
     def _process_search(
         self,
         search: Search,
         stats: CycleStats,
     ) -> None:
+        """Scrape and process one configured search."""
+
         LOGGER.info(
             "Searching: %s",
             search.name,
         )
 
-        self.scraper.open(search.url)
-        self.scraper.accept_cookies()
+        listings = self.scraper.fetch(
+            search.url
+        )
 
-        listings = self.scraper.fetch()
-
-        stats.listings_found += len(listings)
+        stats.listings_found += len(
+            listings
+        )
 
         LOGGER.info(
-            "Found %s listings",
+            "Found %d listings",
             len(listings),
         )
 
-        search_new = 0
+        new_for_search = 0
 
         for listing in listings:
-            if self.stop_event.is_set():
+            if STOP_EVENT.is_set():
                 break
 
-            listing.search_id = str(search.id)
-            listing.search_name = search.name
-
-            if not allow(listing, search):
-                stats.listings_filtered += 1
-                continue
-
             try:
-                if self._process_listing(
+                listing.search_id = search.id
+                listing.search_name = search.name
+
+                if not allow(
+                    listing,
+                    search,
+                ):
+                    stats.listings_filtered += 1
+                    continue
+
+                is_new = self._process_listing(
                     listing,
                     stats,
-                ):
-                    search_new += 1
+                )
+
+                if is_new:
+                    new_for_search += 1
+                    stats.new_listings += 1
 
             except Exception:
                 stats.failed_listings += 1
 
                 LOGGER.exception(
-                    "Unable to process listing %s from search %s",
-                    listing.id,
-                    search.name,
+                    "Unable to process listing %s",
+                    getattr(
+                        listing,
+                        "id",
+                        "unknown",
+                    ),
                 )
 
         LOGGER.info(
-            "New listings: %s",
-            search_new,
+            "New listings: %d",
+            new_for_search,
         )
 
     def _process_listing(
@@ -256,11 +239,17 @@ class VintedAgent:
         listing: Listing,
         stats: CycleStats,
     ) -> bool:
-        existing = self.database.get(
+        """
+        Process one allowed listing.
+
+        Returns True only when the listing is newly discovered.
+        """
+
+        stored = self.database.get(
             listing.id
         )
 
-        if existing is None:
+        if stored is None:
             inserted = self.database.save(
                 listing
             )
@@ -274,36 +263,51 @@ class VintedAgent:
                 )
             )
 
-            if not notification_sent:
+            if notification_sent:
+                LOGGER.info(
+                    "NEW | %s | %s | %s",
+                    listing.search_name,
+                    listing.title,
+                    listing.price,
+                )
+
+            else:
                 LOGGER.warning(
-                    "New-listing notification failed for %s",
+                    "New-listing notification failed "
+                    "for %s",
                     listing.id,
                 )
 
-            LOGGER.info(
-                "NEW | %s | %s | %s",
-                listing.search_name,
-                listing.title,
-                listing.price,
-            )
-
-            stats.new_listings += 1
-
             return True
 
+        self.database.touch(
+            listing.id
+        )
+
         old_price = self._stored_price(
-            existing["current_price"],
-            fallback=listing.price_value,
+            stored
         )
 
-        price_difference = (
-            listing.price_value - old_price
+        new_price = listing.price_value
+
+        difference = (
+            new_price - old_price
         )
 
-        if price_difference < -PRICE_TOLERANCE:
-            self.database.update_price(
-                listing
-            )
+        if abs(
+            difference
+        ) < PRICE_TOLERANCE:
+            return False
+
+        updated = self.database.update_price(
+            listing
+        )
+
+        if not updated:
+            return False
+
+        if difference < 0:
+            stats.price_drops += 1
 
             notification_sent = (
                 self.telegram.send_price_drop(
@@ -312,198 +316,532 @@ class VintedAgent:
                 )
             )
 
-            if not notification_sent:
+            if notification_sent:
+                LOGGER.info(
+                    "PRICE DROP | %s | %s | "
+                    "£%.2f -> £%.2f",
+                    listing.search_name,
+                    listing.title,
+                    old_price,
+                    new_price,
+                )
+
+            else:
                 LOGGER.warning(
-                    "Price-drop notification failed for %s",
+                    "Price-drop notification failed "
+                    "for %s",
                     listing.id,
                 )
 
-            LOGGER.info(
-                "PRICE DROP | %s | %.2f -> %.2f",
-                listing.search_name,
-                old_price,
-                listing.price_value,
-            )
-
-            stats.price_drops += 1
-
-            return False
-
-        if price_difference > PRICE_TOLERANCE:
-            self.database.update_price(
-                listing
-            )
-
-            LOGGER.info(
-                "PRICE UPDATE | %s | %.2f -> %.2f",
-                listing.search_name,
-                old_price,
-                listing.price_value,
-            )
-
+        else:
             stats.price_increases += 1
 
-            return False
-
-        self.database.touch(
-            listing.id
-        )
+            LOGGER.info(
+                "PRICE INCREASE | %s | %s | "
+                "£%.2f -> £%.2f",
+                listing.search_name,
+                listing.title,
+                old_price,
+                new_price,
+            )
 
         return False
+
+    def _check_listing_statuses(
+        self,
+        stats: CycleStats,
+    ) -> None:
+        """
+        Check stored item pages for availability.
+
+        A listing is never marked sold simply because it disappears
+        from the first catalogue page. Its item URL is checked directly.
+        """
+
+        try:
+            listings = (
+                self.database
+                .listings_for_status_check(
+                    STATUS_CHECK_BATCH_SIZE
+                )
+            )
+
+        except Exception:
+            stats.status_failures += 1
+
+            LOGGER.exception(
+                "Unable to load listing status queue"
+            )
+
+            return
+
+        if not listings:
+            LOGGER.info(
+                "No listings waiting for status check"
+            )
+            return
+
+        LOGGER.info(
+            "Checking availability of %d "
+            "stored listings",
+            len(listings),
+        )
+
+        for index, stored in enumerate(
+            listings
+        ):
+            if STOP_EVENT.is_set():
+                return
+
+            listing_id = str(
+                stored["id"]
+            )
+
+            url = str(
+                stored["url"]
+            )
+
+            try:
+                result = (
+                    self.status_checker.check(
+                        url
+                    )
+                )
+
+                stats.status_checks += 1
+
+                if (
+                    result.status
+                    == ListingStatus.UNKNOWN
+                ):
+                    stats.status_failures += 1
+
+                    LOGGER.debug(
+                        "UNKNOWN STATUS | %s | %s",
+                        listing_id,
+                        stored["title"],
+                    )
+
+                elif (
+                    result.status
+                    == ListingStatus.SOLD
+                ):
+                    changed = (
+                        self.database
+                        .set_listing_status(
+                            listing_id,
+                            ListingStatus.SOLD.value,
+                        )
+                    )
+
+                    if changed:
+                        stats.sold_detected += 1
+
+                        LOGGER.info(
+                            "SOLD | %s | %s | £%.2f",
+                            stored["search_name"],
+                            stored["title"],
+                            self._stored_price(
+                                stored
+                            ),
+                        )
+
+                elif (
+                    result.status
+                    == ListingStatus.NOT_FOUND
+                ):
+                    changed = (
+                        self.database
+                        .set_listing_status(
+                            listing_id,
+                            ListingStatus.NOT_FOUND.value,
+                        )
+                    )
+
+                    if changed:
+                        stats.unavailable_detected += 1
+
+                        LOGGER.info(
+                            "NOT FOUND | %s | %s",
+                            stored["search_name"],
+                            stored["title"],
+                        )
+
+                elif (
+                    result.status
+                    == ListingStatus.ACTIVE
+                ):
+                    changed = (
+                        self.database
+                        .set_listing_status(
+                            listing_id,
+                            ListingStatus.ACTIVE.value,
+                        )
+                    )
+
+                    if changed:
+                        LOGGER.info(
+                            "ACTIVE AGAIN | %s | %s",
+                            stored["search_name"],
+                            stored["title"],
+                        )
+
+            except Exception:
+                stats.status_failures += 1
+
+                LOGGER.exception(
+                    "Status check failed for "
+                    "listing %s",
+                    listing_id,
+                )
+
+            if (
+                index < len(listings) - 1
+                and not STOP_EVENT.is_set()
+            ):
+                STOP_EVENT.wait(
+                    STATUS_CHECK_DELAY
+                )
 
     def _log_cycle_summary(
         self,
         stats: CycleStats,
     ) -> None:
-        try:
-            database_size = (
-                self.database.count()
-            )
-        except Exception:
-            database_size = -1
-            LOGGER.exception(
-                "Unable to read database size"
-            )
+        """Log cycle and sold-market statistics."""
 
-        LOGGER.info(SEPARATOR)
+        LOGGER.info("=" * 60)
+
         LOGGER.info(
-            "Listings found    : %s",
+            "Listings found    : %d",
             stats.listings_found,
         )
+
         LOGGER.info(
-            "Listings filtered : %s",
+            "Listings filtered : %d",
             stats.listings_filtered,
         )
+
         LOGGER.info(
-            "New listings      : %s",
+            "New listings      : %d",
             stats.new_listings,
         )
+
         LOGGER.info(
-            "Price drops       : %s",
+            "Price drops       : %d",
             stats.price_drops,
         )
+
         LOGGER.info(
-            "Price increases   : %s",
+            "Price increases   : %d",
             stats.price_increases,
         )
+
         LOGGER.info(
-            "Failed listings   : %s",
+            "Failed listings   : %d",
             stats.failed_listings,
         )
+
         LOGGER.info(
-            "Failed searches   : %s",
+            "Failed searches   : %d",
             stats.failed_searches,
         )
 
-        if database_size >= 0:
-            LOGGER.info(
-                "Database size     : %s",
-                database_size,
+        LOGGER.info(
+            "Status checks     : %d",
+            stats.status_checks,
+        )
+
+        LOGGER.info(
+            "Newly sold        : %d",
+            stats.sold_detected,
+        )
+
+        LOGGER.info(
+            "New unavailable   : %d",
+            stats.unavailable_detected,
+        )
+
+        LOGGER.info(
+            "Status failures   : %d",
+            stats.status_failures,
+        )
+
+        LOGGER.info(
+            "Database size     : %d",
+            self.database.count(),
+        )
+
+        self._log_sold_statistics()
+
+        LOGGER.info("=" * 60)
+
+    def _log_sold_statistics(
+        self,
+    ) -> None:
+        """Log cumulative sold statistics."""
+
+        try:
+            sold = (
+                self.database.sold_statistics()
             )
 
-        LOGGER.info(SEPARATOR)
+            LOGGER.info("-" * 60)
+            LOGGER.info(
+                "SOLD MARKET STATISTICS"
+            )
+            LOGGER.info("-" * 60)
+
+            LOGGER.info(
+                "Active listings   : %d",
+                sold["active"],
+            )
+
+            LOGGER.info(
+                "Sold listings     : %d",
+                sold["sold"],
+            )
+
+            LOGGER.info(
+                "Sold today        : %d",
+                sold["sold_today"],
+            )
+
+            LOGGER.info(
+                "Sold last 7 days  : %d",
+                sold["sold_last_7_days"],
+            )
+
+            LOGGER.info(
+                "Not found         : %d",
+                sold["not_found"],
+            )
+
+            LOGGER.info(
+                "Unknown           : %d",
+                sold["unknown"],
+            )
+
+            LOGGER.info(
+                "Sell-through rate : %.1f%%",
+                sold["sell_through_rate"],
+            )
+
+            average_price = (
+                sold["average_sold_price"]
+            )
+
+            if average_price is None:
+                LOGGER.info(
+                    "Average sold price: n/a"
+                )
+
+            else:
+                LOGGER.info(
+                    "Average sold price: £%.2f",
+                    average_price,
+                )
+
+            average_days = (
+                sold["average_days_to_sell"]
+            )
+
+            if average_days is None:
+                LOGGER.info(
+                    "Avg days to sell : n/a"
+                )
+
+            else:
+                LOGGER.info(
+                    "Avg days to sell : %.2f",
+                    average_days,
+                )
+
+            search_stats = (
+                self.database
+                .sold_statistics_by_search()
+            )
+
+            if not search_stats:
+                return
+
+            LOGGER.info("-" * 60)
+            LOGGER.info(
+                "SOLD BY SEARCH"
+            )
+            LOGGER.info("-" * 60)
+
+            for row in search_stats:
+                total = int(
+                    row["total"] or 0
+                )
+
+                sold_count = int(
+                    row["sold"] or 0
+                )
+
+                rate = (
+                    sold_count
+                    / total
+                    * 100.0
+                    if total
+                    else 0.0
+                )
+
+                average_sold_price = (
+                    row["average_sold_price"]
+                )
+
+                if average_sold_price is None:
+                    price_text = "n/a"
+
+                else:
+                    price_text = (
+                        f"£{float(average_sold_price):.2f}"
+                    )
+
+                average_days_to_sell = (
+                    row["average_days_to_sell"]
+                )
+
+                if average_days_to_sell is None:
+                    days_text = "n/a"
+
+                else:
+                    days_text = (
+                        f"{float(average_days_to_sell):.2f}"
+                    )
+
+                LOGGER.info(
+                    "%s | total=%d | sold=%d | "
+                    "rate=%.1f%% | avg=%s | "
+                    "days=%s",
+                    row["search_name"]
+                    or "Unknown",
+                    total,
+                    sold_count,
+                    rate,
+                    price_text,
+                    days_text,
+                )
+
+        except Exception:
+            LOGGER.exception(
+                "Unable to calculate sold statistics"
+            )
+
+    def close(self) -> None:
+        """Cleanly close application resources."""
+
+        LOGGER.info(
+            "Stopping Vinted Agent"
+        )
+
+        try:
+            self.status_checker.close()
+
+        except Exception:
+            LOGGER.exception(
+                "Unable to close status checker"
+            )
+
+        try:
+            self.telegram.close()
+
+        except Exception:
+            LOGGER.exception(
+                "Unable to close Telegram client"
+            )
+
+        try:
+            self.scraper.stop()
+
+        except Exception:
+            LOGGER.exception(
+                "Unable to stop browser"
+            )
+
+        try:
+            self.database.close()
+
+        except Exception:
+            LOGGER.exception(
+                "Unable to close database"
+            )
+
+        LOGGER.info(
+            "Vinted Agent stopped"
+        )
 
     @staticmethod
     def _stored_price(
-        value: object,
-        fallback: float,
+        stored: object,
     ) -> float:
-        try:
-            price = float(value)
-        except (TypeError, ValueError):
-            return fallback
-
-        if not math.isfinite(price):
-            return fallback
-
-        return price
-
-
-def install_signal_handlers() -> None:
-    """Handle Ctrl+C and systemd termination gracefully."""
-
-    def handle_shutdown(
-        signum: int,
-        frame: FrameType | None,
-    ) -> None:
-        del frame
+        """Extract stored numerical price."""
 
         try:
-            signal_name = signal.Signals(
-                signum
-            ).name
-        except ValueError:
-            signal_name = str(signum)
+            value = stored[
+                "current_price"
+            ]  # type: ignore[index]
 
-        LOGGER.info(
-            "Received %s; shutting down",
-            signal_name,
-        )
+            if value is None:
+                return 0.0
 
-        STOP_EVENT.set()
+            return float(value)
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            IndexError,
+        ):
+            return 0.0
+
+
+def _handle_shutdown(
+    signum: int,
+    frame: object,
+) -> None:
+    """Handle SIGINT/SIGTERM."""
+
+    LOGGER.info(
+        "Shutdown signal received: %s",
+        signum,
+    )
+
+    STOP_EVENT.set()
+
+
+def main() -> None:
+    """Application entry point."""
+
+    configure_logging()
 
     signal.signal(
         signal.SIGINT,
-        handle_shutdown,
+        _handle_shutdown,
     )
 
     signal.signal(
         signal.SIGTERM,
-        handle_shutdown,
+        _handle_shutdown,
     )
 
-
-def run_once() -> CycleStats:
-    """Run one monitoring cycle and close resources afterward."""
-
-    agent = VintedAgent(
-        stop_event=STOP_EVENT
-    )
+    agent = VintedAgent()
 
     try:
-        agent.start()
-        return agent.run_cycle()
-    finally:
-        agent.close()
-
-
-def main() -> int:
-    """Run Vinted Agent as a long-lived service."""
-
-    configure_logging()
-    install_signal_handlers()
-
-    agent: VintedAgent | None = None
-
-    try:
-        agent = VintedAgent(
-            stop_event=STOP_EVENT
-        )
-
         agent.run_forever()
-
-        return 0
 
     except KeyboardInterrupt:
         STOP_EVENT.set()
-
-        LOGGER.info(
-            "Interrupted by user"
-        )
-
-        return 0
 
     except Exception:
         LOGGER.exception(
             "Fatal Vinted Agent error"
         )
 
-        return 1
-
     finally:
-        if agent is not None:
-            agent.close()
+        agent.close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
