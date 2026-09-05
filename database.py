@@ -21,11 +21,17 @@ class DatabaseError(RuntimeError):
 class Database:
     """Store listings, prices, availability status, and statistics."""
 
-    def __init__(self, filename: str | Path = "data/listings.db") -> None:
+    def __init__(
+        self,
+        filename: str | Path = "data/listings.db",
+    ) -> None:
         self.filename = Path(filename)
 
         if str(filename) != ":memory:":
-            self.filename.parent.mkdir(parents=True, exist_ok=True)
+            self.filename.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
         try:
             self.connection = sqlite3.connect(
@@ -44,18 +50,31 @@ class Database:
         self.create_tables()
         self.upgrade_database()
 
-        LOGGER.info("Database opened: %s", filename)
+        LOGGER.info(
+            "Database opened: %s",
+            filename,
+        )
 
     def _configure(self) -> None:
-        """Configure SQLite for reliable long-running operation."""
+        """Configure SQLite for long-running operation."""
 
         try:
-            self.connection.execute("PRAGMA foreign_keys = ON")
-            self.connection.execute("PRAGMA busy_timeout = 10000")
+            self.connection.execute(
+                "PRAGMA foreign_keys = ON"
+            )
+
+            self.connection.execute(
+                "PRAGMA busy_timeout = 10000"
+            )
 
             if str(self.filename) != ":memory:":
-                self.connection.execute("PRAGMA journal_mode = WAL")
-                self.connection.execute("PRAGMA synchronous = NORMAL")
+                self.connection.execute(
+                    "PRAGMA journal_mode = WAL"
+                )
+
+                self.connection.execute(
+                    "PRAGMA synchronous = NORMAL"
+                )
 
         except sqlite3.Error as exc:
             raise DatabaseError(
@@ -63,7 +82,12 @@ class Database:
             ) from exc
 
     def create_tables(self) -> None:
-        """Create the current database schema."""
+        """
+        Create base tables.
+
+        Index creation is performed after migrations so older databases
+        can safely receive new columns first.
+        """
 
         try:
             self.connection.executescript(
@@ -86,10 +110,15 @@ class Database:
                     url TEXT NOT NULL,
                     image TEXT,
 
-                    first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    first_seen TEXT NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
 
-                    listing_status TEXT NOT NULL DEFAULT 'active',
+                    last_seen TEXT NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    listing_status TEXT NOT NULL
+                        DEFAULT 'active',
+
                     sold_at TEXT,
                     status_checked_at TEXT
                 );
@@ -100,36 +129,13 @@ class Database:
                     listing_id TEXT NOT NULL,
                     price REAL NOT NULL,
 
-                    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    recorded_at TEXT NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
 
                     FOREIGN KEY (listing_id)
                         REFERENCES listings(id)
                         ON DELETE CASCADE
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_listings_search_name
-                    ON listings(search_name);
-
-                CREATE INDEX IF NOT EXISTS idx_listings_last_seen
-                    ON listings(last_seen);
-
-                CREATE INDEX IF NOT EXISTS idx_listings_current_price
-                    ON listings(current_price);
-
-                CREATE INDEX IF NOT EXISTS idx_listings_status
-                    ON listings(listing_status);
-
-                CREATE INDEX IF NOT EXISTS idx_listings_status_checked
-                    ON listings(status_checked_at);
-
-                CREATE INDEX IF NOT EXISTS idx_listings_sold_at
-                    ON listings(sold_at);
-
-                CREATE INDEX IF NOT EXISTS idx_price_history_listing
-                    ON price_history(listing_id);
-
-                CREATE INDEX IF NOT EXISTS idx_price_history_time
-                    ON price_history(recorded_at);
                 """
             )
 
@@ -141,7 +147,7 @@ class Database:
             ) from exc
 
     def upgrade_database(self) -> None:
-        """Upgrade databases created by older versions of the agent."""
+        """Upgrade databases created by older versions."""
 
         try:
             columns = self._listing_columns()
@@ -153,22 +159,28 @@ class Database:
                 "previous_price": "REAL",
                 "first_seen": "TEXT",
                 "last_seen": "TEXT",
-                "listing_status": "TEXT DEFAULT 'active'",
+                "listing_status": (
+                    "TEXT DEFAULT 'active'"
+                ),
                 "sold_at": "TEXT",
                 "status_checked_at": "TEXT",
             }
 
             for column, definition in additions.items():
-                if column not in columns:
-                    LOGGER.info(
-                        "Adding database column: listings.%s",
-                        column,
-                    )
+                if column in columns:
+                    continue
 
-                    self.connection.execute(
-                        f"ALTER TABLE listings "
-                        f"ADD COLUMN {column} {definition}"
-                    )
+                LOGGER.info(
+                    "Adding database column: listings.%s",
+                    column,
+                )
+
+                self.connection.execute(
+                    f"""
+                    ALTER TABLE listings
+                    ADD COLUMN {column} {definition}
+                    """
+                )
 
             self.connection.execute(
                 """
@@ -181,7 +193,10 @@ class Database:
             self.connection.execute(
                 """
                 UPDATE listings
-                SET last_seen = COALESCE(first_seen, CURRENT_TIMESTAMP)
+                SET last_seen = COALESCE(
+                    first_seen,
+                    CURRENT_TIMESTAMP
+                )
                 WHERE last_seen IS NULL
                 """
             )
@@ -197,46 +212,36 @@ class Database:
 
             rows = self.connection.execute(
                 """
-                SELECT id, price, current_price
+                SELECT
+                    id,
+                    price,
+                    current_price
                 FROM listings
                 """
             ).fetchall()
 
             for row in rows:
-                if row["current_price"] is None:
-                    price = self._safe_price(row["price"])
+                if row["current_price"] is not None:
+                    continue
 
-                    self.connection.execute(
-                        """
-                        UPDATE listings
-                        SET current_price = ?
-                        WHERE id = ?
-                        """,
-                        (price, row["id"]),
-                    )
+                price = self._safe_price(
+                    row["price"]
+                )
+
+                self.connection.execute(
+                    """
+                    UPDATE listings
+                    SET current_price = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        price,
+                        row["id"],
+                    ),
+                )
 
             self._seed_missing_price_history()
-
-            self.connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_listings_status
-                ON listings(listing_status)
-                """
-            )
-
-            self.connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_listings_status_checked
-                ON listings(status_checked_at)
-                """
-            )
-
-            self.connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_listings_sold_at
-                ON listings(sold_at)
-                """
-            )
+            self._create_indexes()
 
             self.connection.execute(
                 f"PRAGMA user_version = {SCHEMA_VERSION}"
@@ -251,8 +256,54 @@ class Database:
                 f"Unable to upgrade database: {exc}"
             ) from exc
 
-    def get(self, listing_id: str) -> sqlite3.Row | None:
-        """Return one stored listing."""
+    def _create_indexes(self) -> None:
+        """Create database indexes after schema migration."""
+
+        self.connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_listings_search_id
+            ON listings(search_id);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_listings_search_name
+            ON listings(search_name);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_listings_last_seen
+            ON listings(last_seen);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_listings_current_price
+            ON listings(current_price);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_listings_status
+            ON listings(listing_status);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_listings_status_checked
+            ON listings(status_checked_at);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_listings_sold_at
+            ON listings(sold_at);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_price_history_listing
+            ON price_history(listing_id);
+
+            CREATE INDEX IF NOT EXISTS
+                idx_price_history_time
+            ON price_history(recorded_at);
+            """
+        )
+
+    def get(
+        self,
+        listing_id: str,
+    ) -> sqlite3.Row | None:
+        """Return a stored listing."""
 
         try:
             return self.connection.execute(
@@ -266,11 +317,15 @@ class Database:
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to load listing {listing_id}: {exc}"
+                f"Unable to load listing "
+                f"{listing_id}: {exc}"
             ) from exc
 
-    def exists(self, listing_id: str) -> bool:
-        """Return True if the listing already exists."""
+    def exists(
+        self,
+        listing_id: str,
+    ) -> bool:
+        """Return True when a listing already exists."""
 
         try:
             row = self.connection.execute(
@@ -287,14 +342,19 @@ class Database:
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to check listing {listing_id}: {exc}"
+                f"Unable to check listing "
+                f"{listing_id}: {exc}"
             ) from exc
 
-    def save(self, listing: Listing) -> bool:
+    def save(
+        self,
+        listing: Listing,
+    ) -> bool:
         """
         Save a new listing.
 
-        Returns True when inserted and False when it already existed.
+        Returns True when inserted.
+        Returns False when the listing already exists.
         """
 
         try:
@@ -362,19 +422,50 @@ class Database:
             self.connection.rollback()
 
             raise DatabaseError(
-                f"Unable to save listing {listing.id}: {exc}"
+                f"Unable to save listing "
+                f"{listing.id}: {exc}"
             ) from exc
 
     def update_price(
         self,
-        listing_id: str,
-        new_price: float,
+        listing: Listing | str,
+        new_price: float | None = None,
     ) -> bool:
         """
-        Update a stored listing price.
+        Update a listing price.
 
-        Returns True only when the numerical price actually changed.
+        Supports both APIs:
+
+            update_price(listing)
+
+        and:
+
+            update_price(listing_id, new_price)
+
+        This keeps older code and tests compatible.
         """
+
+        if isinstance(listing, Listing):
+            listing_id = listing.id
+            price_value = listing.price_value
+
+            price_text: str | None = listing.price
+            total_price_text: str | None = (
+                listing.total_price
+            )
+
+        else:
+            listing_id = str(listing)
+
+            if new_price is None:
+                raise ValueError(
+                    "new_price is required when "
+                    "listing ID is supplied"
+                )
+
+            price_value = float(new_price)
+            price_text = None
+            total_price_text = None
 
         try:
             row = self.connection.execute(
@@ -389,26 +480,54 @@ class Database:
             if row is None:
                 return False
 
-            old_price = self._safe_price(row["current_price"])
-            new_price = self._safe_price(new_price)
+            old_price = self._safe_price(
+                row["current_price"]
+            )
 
-            if abs(old_price - new_price) < 0.005:
+            price_value = self._safe_price(
+                price_value
+            )
+
+            if abs(
+                old_price - price_value
+            ) < 0.005:
                 return False
 
-            self.connection.execute(
-                """
-                UPDATE listings
-                SET
-                    previous_price = current_price,
-                    current_price = ?,
-                    last_seen = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (
-                    new_price,
-                    listing_id,
-                ),
-            )
+            if price_text is not None:
+                self.connection.execute(
+                    """
+                    UPDATE listings
+                    SET
+                        previous_price = current_price,
+                        current_price = ?,
+                        price = ?,
+                        total_price = ?,
+                        last_seen = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        price_value,
+                        price_text,
+                        total_price_text,
+                        listing_id,
+                    ),
+                )
+
+            else:
+                self.connection.execute(
+                    """
+                    UPDATE listings
+                    SET
+                        previous_price = current_price,
+                        current_price = ?,
+                        last_seen = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        price_value,
+                        listing_id,
+                    ),
+                )
 
             self.connection.execute(
                 """
@@ -420,7 +539,7 @@ class Database:
                 """,
                 (
                     listing_id,
-                    new_price,
+                    price_value,
                 ),
             )
 
@@ -432,16 +551,15 @@ class Database:
             self.connection.rollback()
 
             raise DatabaseError(
-                f"Unable to update price for {listing_id}: {exc}"
+                f"Unable to update price for "
+                f"{listing_id}: {exc}"
             ) from exc
 
-    def touch(self, listing_id: str) -> None:
-        """
-        Mark a listing as seen in the latest catalogue scrape.
-
-        If a previously unavailable listing appears again, restore it to
-        active unless it was explicitly confirmed as sold.
-        """
+    def touch(
+        self,
+        listing_id: str,
+    ) -> None:
+        """Mark a listing as seen in the latest scrape."""
 
         try:
             self.connection.execute(
@@ -452,7 +570,7 @@ class Database:
                     listing_status =
                         CASE
                             WHEN listing_status = 'sold'
-                                THEN listing_status
+                                THEN 'sold'
                             ELSE 'active'
                         END
                 WHERE id = ?
@@ -466,7 +584,8 @@ class Database:
             self.connection.rollback()
 
             raise DatabaseError(
-                f"Unable to touch listing {listing_id}: {exc}"
+                f"Unable to touch listing "
+                f"{listing_id}: {exc}"
             ) from exc
 
     def set_listing_status(
@@ -475,12 +594,12 @@ class Database:
         status: str,
     ) -> bool:
         """
-        Store the latest verified availability state.
+        Store a verified listing availability state.
 
-        Returns True when the listing changed to a different status.
+        Returns True if the status changed.
         """
 
-        allowed = {
+        allowed_statuses = {
             "active",
             "sold",
             "not_found",
@@ -489,7 +608,7 @@ class Database:
 
         status = status.strip().lower()
 
-        if status not in allowed:
+        if status not in allowed_statuses:
             raise ValueError(
                 f"Unsupported listing status: {status}"
             )
@@ -511,7 +630,9 @@ class Database:
                 row["listing_status"] or "active"
             ).strip().lower()
 
-            changed = previous_status != status
+            changed = (
+                previous_status != status
+            )
 
             if status == "sold":
                 self.connection.execute(
@@ -523,7 +644,8 @@ class Database:
                             sold_at,
                             CURRENT_TIMESTAMP
                         ),
-                        status_checked_at = CURRENT_TIMESTAMP
+                        status_checked_at =
+                            CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (listing_id,),
@@ -536,7 +658,8 @@ class Database:
                     SET
                         listing_status = 'active',
                         sold_at = NULL,
-                        status_checked_at = CURRENT_TIMESTAMP
+                        status_checked_at =
+                            CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (listing_id,),
@@ -548,7 +671,8 @@ class Database:
                     UPDATE listings
                     SET
                         listing_status = ?,
-                        status_checked_at = CURRENT_TIMESTAMP
+                        status_checked_at =
+                            CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (
@@ -565,7 +689,7 @@ class Database:
             self.connection.rollback()
 
             raise DatabaseError(
-                f"Unable to update listing status for "
+                f"Unable to update status for "
                 f"{listing_id}: {exc}"
             ) from exc
 
@@ -574,12 +698,15 @@ class Database:
         limit: int = 10,
     ) -> list[sqlite3.Row]:
         """
-        Return listings that should be checked for sale status.
+        Return listings waiting for availability checking.
 
-        The oldest status checks are returned first.
+        Never rechecks confirmed sold listings.
         """
 
-        limit = max(1, int(limit))
+        limit = max(
+            1,
+            int(limit),
+        )
 
         try:
             return self.connection.execute(
@@ -599,7 +726,8 @@ class Database:
                 WHERE listing_status != 'sold'
                 ORDER BY
                     CASE
-                        WHEN status_checked_at IS NULL THEN 0
+                        WHEN status_checked_at IS NULL
+                        THEN 0
                         ELSE 1
                     END,
                     status_checked_at ASC,
@@ -611,11 +739,12 @@ class Database:
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to load status-check queue: {exc}"
+                "Unable to load status-check queue: "
+                f"{exc}"
             ) from exc
 
     def count(self) -> int:
-        """Return total number of stored listings."""
+        """Return total stored listing count."""
 
         try:
             row = self.connection.execute(
@@ -625,7 +754,9 @@ class Database:
                 """
             ).fetchone()
 
-            return int(row["count"])
+            return int(
+                row["count"]
+            )
 
         except sqlite3.Error as exc:
             raise DatabaseError(
@@ -634,9 +765,13 @@ class Database:
 
     def count_for_search(
         self,
-        search_id: str,
+        search: str,
     ) -> int:
-        """Return total listings stored for a configured search."""
+        """
+        Count listings belonging to a search.
+
+        Supports both search ID and search name for compatibility.
+        """
 
         try:
             row = self.connection.execute(
@@ -644,22 +779,29 @@ class Database:
                 SELECT COUNT(*) AS count
                 FROM listings
                 WHERE search_id = ?
+                   OR search_name = ?
                 """,
-                (search_id,),
+                (
+                    search,
+                    search,
+                ),
             ).fetchone()
 
-            return int(row["count"])
+            return int(
+                row["count"]
+            )
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to count search {search_id}: {exc}"
+                f"Unable to count search "
+                f"{search}: {exc}"
             ) from exc
 
     def count_by_status(
         self,
         status: str,
     ) -> int:
-        """Return number of listings with a given status."""
+        """Count listings with a given status."""
 
         try:
             row = self.connection.execute(
@@ -671,18 +813,21 @@ class Database:
                 (status,),
             ).fetchone()
 
-            return int(row["count"])
+            return int(
+                row["count"]
+            )
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to count status {status}: {exc}"
+                f"Unable to count status "
+                f"{status}: {exc}"
             ) from exc
 
     def price_history(
         self,
         listing_id: str,
     ) -> list[sqlite3.Row]:
-        """Return chronological price history for a listing."""
+        """Return chronological price history."""
 
         try:
             return self.connection.execute(
@@ -692,15 +837,17 @@ class Database:
                     recorded_at
                 FROM price_history
                 WHERE listing_id = ?
-                ORDER BY recorded_at ASC, id ASC
+                ORDER BY
+                    recorded_at ASC,
+                    id ASC
                 """,
                 (listing_id,),
             ).fetchall()
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to load price history for "
-                f"{listing_id}: {exc}"
+                f"Unable to load price history "
+                f"for {listing_id}: {exc}"
             ) from exc
 
     def recent_listings(
@@ -717,22 +864,31 @@ class Database:
                 ORDER BY first_seen DESC
                 LIMIT ?
                 """,
-                (max(1, int(limit)),),
+                (
+                    max(
+                        1,
+                        int(limit),
+                    ),
+                ),
             ).fetchall()
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to load recent listings: {exc}"
+                f"Unable to load recent listings: "
+                f"{exc}"
             ) from exc
 
-    def sold_statistics(self) -> dict[str, Any]:
-        """Return overall sold-market statistics."""
+    def sold_statistics(
+        self,
+    ) -> dict[str, Any]:
+        """Return overall sold statistics."""
 
         try:
             totals = self.connection.execute(
                 """
                 SELECT
                     COUNT(*) AS total,
+
                     SUM(
                         CASE
                             WHEN listing_status = 'active'
@@ -740,6 +896,7 @@ class Database:
                             ELSE 0
                         END
                     ) AS active,
+
                     SUM(
                         CASE
                             WHEN listing_status = 'sold'
@@ -747,6 +904,7 @@ class Database:
                             ELSE 0
                         END
                     ) AS sold,
+
                     SUM(
                         CASE
                             WHEN listing_status = 'not_found'
@@ -754,6 +912,7 @@ class Database:
                             ELSE 0
                         END
                     ) AS not_found,
+
                     SUM(
                         CASE
                             WHEN listing_status = 'unknown'
@@ -761,64 +920,99 @@ class Database:
                             ELSE 0
                         END
                     ) AS unknown,
+
                     AVG(
                         CASE
                             WHEN listing_status = 'sold'
                             THEN current_price
                         END
                     ) AS average_sold_price
+
                 FROM listings
                 """
             ).fetchone()
 
-            sold_today = self.connection.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM listings
-                WHERE listing_status = 'sold'
-                  AND sold_at IS NOT NULL
-                  AND DATE(sold_at) = DATE('now')
-                """
-            ).fetchone()["count"]
+            sold_today_row = (
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM listings
+                    WHERE listing_status = 'sold'
+                      AND sold_at IS NOT NULL
+                      AND DATE(sold_at) =
+                          DATE('now')
+                    """
+                ).fetchone()
+            )
 
-            sold_week = self.connection.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM listings
-                WHERE listing_status = 'sold'
-                  AND sold_at IS NOT NULL
-                  AND sold_at >= DATETIME(
-                      'now',
-                      '-7 days'
-                  )
-                """
-            ).fetchone()["count"]
+            sold_week_row = (
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM listings
+                    WHERE listing_status = 'sold'
+                      AND sold_at IS NOT NULL
+                      AND sold_at >= DATETIME(
+                          'now',
+                          '-7 days'
+                      )
+                    """
+                ).fetchone()
+            )
 
-            average_days = self.connection.execute(
-                """
-                SELECT AVG(
-                    JULIANDAY(sold_at) -
-                    JULIANDAY(first_seen)
-                ) AS value
-                FROM listings
-                WHERE listing_status = 'sold'
-                  AND sold_at IS NOT NULL
-                  AND first_seen IS NOT NULL
-                """
-            ).fetchone()["value"]
+            average_days_row = (
+                self.connection.execute(
+                    """
+                    SELECT
+                        AVG(
+                            JULIANDAY(sold_at) -
+                            JULIANDAY(first_seen)
+                        ) AS value
+                    FROM listings
+                    WHERE listing_status = 'sold'
+                      AND sold_at IS NOT NULL
+                      AND first_seen IS NOT NULL
+                    """
+                ).fetchone()
+            )
 
-            total = int(totals["total"] or 0)
-            sold = int(totals["sold"] or 0)
+            total = int(
+                totals["total"] or 0
+            )
+
+            sold = int(
+                totals["sold"] or 0
+            )
 
             sell_through_rate = (
                 (sold / total) * 100.0
-                if total
+                if total > 0
                 else 0.0
+            )
+
+            average_sold_price = (
+                float(
+                    totals["average_sold_price"]
+                )
+                if totals["average_sold_price"]
+                is not None
+                else None
+            )
+
+            average_days = (
+                float(
+                    average_days_row["value"]
+                )
+                if average_days_row["value"]
+                is not None
+                else None
             )
 
             return {
                 "total": total,
-                "active": int(totals["active"] or 0),
+                "active": int(
+                    totals["active"] or 0
+                ),
                 "sold": sold,
                 "not_found": int(
                     totals["not_found"] or 0
@@ -826,33 +1020,33 @@ class Database:
                 "unknown": int(
                     totals["unknown"] or 0
                 ),
-                "sold_today": int(sold_today or 0),
+                "sold_today": int(
+                    sold_today_row["count"] or 0
+                ),
                 "sold_last_7_days": int(
-                    sold_week or 0
+                    sold_week_row["count"] or 0
                 ),
                 "average_sold_price": (
-                    float(totals["average_sold_price"])
-                    if totals["average_sold_price"]
-                    is not None
-                    else None
+                    average_sold_price
                 ),
                 "average_days_to_sell": (
-                    float(average_days)
-                    if average_days is not None
-                    else None
+                    average_days
                 ),
-                "sell_through_rate": sell_through_rate,
+                "sell_through_rate": (
+                    sell_through_rate
+                ),
             }
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to calculate sold statistics: {exc}"
+                "Unable to calculate sold "
+                f"statistics: {exc}"
             ) from exc
 
     def sold_statistics_by_search(
         self,
     ) -> list[sqlite3.Row]:
-        """Return sold statistics grouped by configured search."""
+        """Return sold statistics grouped by search."""
 
         try:
             return self.connection.execute(
@@ -860,7 +1054,9 @@ class Database:
                 SELECT
                     search_id,
                     search_name,
+
                     COUNT(*) AS total,
+
                     SUM(
                         CASE
                             WHEN listing_status = 'active'
@@ -868,6 +1064,7 @@ class Database:
                             ELSE 0
                         END
                     ) AS active,
+
                     SUM(
                         CASE
                             WHEN listing_status = 'sold'
@@ -875,12 +1072,14 @@ class Database:
                             ELSE 0
                         END
                     ) AS sold,
+
                     AVG(
                         CASE
                             WHEN listing_status = 'sold'
                             THEN current_price
                         END
                     ) AS average_sold_price,
+
                     AVG(
                         CASE
                             WHEN listing_status = 'sold'
@@ -891,22 +1090,28 @@ class Database:
                                 JULIANDAY(first_seen)
                         END
                     ) AS average_days_to_sell
+
                 FROM listings
+
                 GROUP BY
                     search_id,
                     search_name
-                ORDER BY search_name
+
+                ORDER BY
+                    search_name
                 """
             ).fetchall()
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to calculate search sold "
-                f"statistics: {exc}"
+                "Unable to calculate sold "
+                f"statistics by search: {exc}"
             ) from exc
 
-    def search_statistics(self) -> list[sqlite3.Row]:
-        """Return basic statistics grouped by configured search."""
+    def search_statistics(
+        self,
+    ) -> list[sqlite3.Row]:
+        """Return statistics grouped by search."""
 
         try:
             return self.connection.execute(
@@ -914,10 +1119,18 @@ class Database:
                 SELECT
                     search_id,
                     search_name,
+
                     COUNT(*) AS listing_count,
-                    MIN(current_price) AS minimum_price,
-                    MAX(current_price) AS maximum_price,
-                    AVG(current_price) AS average_price,
+
+                    MIN(current_price)
+                        AS minimum_price,
+
+                    MAX(current_price)
+                        AS maximum_price,
+
+                    AVG(current_price)
+                        AS average_price,
+
                     SUM(
                         CASE
                             WHEN listing_status = 'sold'
@@ -925,21 +1138,26 @@ class Database:
                             ELSE 0
                         END
                     ) AS sold_count
+
                 FROM listings
+
                 GROUP BY
                     search_id,
                     search_name
-                ORDER BY search_name
+
+                ORDER BY
+                    search_name
                 """
             ).fetchall()
 
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Unable to calculate search statistics: {exc}"
+                "Unable to calculate search "
+                f"statistics: {exc}"
             ) from exc
 
     def clear(self) -> None:
-        """Delete all stored listings and price history."""
+        """Delete all stored data."""
 
         try:
             self.connection.execute(
@@ -952,7 +1170,9 @@ class Database:
 
             self.connection.commit()
 
-            LOGGER.warning("All database data was deleted")
+            LOGGER.warning(
+                "All database data was deleted"
+            )
 
         except sqlite3.Error as exc:
             self.connection.rollback()
@@ -962,11 +1182,14 @@ class Database:
             ) from exc
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close the SQLite connection."""
 
         try:
             self.connection.close()
-            LOGGER.info("Database closed")
+
+            LOGGER.info(
+                "Database closed"
+            )
 
         except sqlite3.Error as exc:
             LOGGER.warning(
@@ -974,7 +1197,9 @@ class Database:
                 exc,
             )
 
-    def _listing_columns(self) -> set[str]:
+    def _listing_columns(
+        self,
+    ) -> set[str]:
         rows = self.connection.execute(
             "PRAGMA table_info(listings)"
         ).fetchall()
@@ -984,7 +1209,9 @@ class Database:
             for row in rows
         }
 
-    def _seed_missing_price_history(self) -> None:
+    def _seed_missing_price_history(
+        self,
+    ) -> None:
         self.connection.execute(
             """
             INSERT INTO price_history (
@@ -992,6 +1219,7 @@ class Database:
                 price,
                 recorded_at
             )
+
             SELECT
                 listings.id,
                 listings.current_price,
@@ -999,24 +1227,34 @@ class Database:
                     listings.first_seen,
                     CURRENT_TIMESTAMP
                 )
+
             FROM listings
-            WHERE listings.current_price IS NOT NULL
+
+            WHERE listings.current_price
+                  IS NOT NULL
+
               AND NOT EXISTS (
                     SELECT 1
                     FROM price_history
-                    WHERE
-                        price_history.listing_id =
-                        listings.id
+                    WHERE price_history.listing_id =
+                          listings.id
               )
             """
         )
 
     @staticmethod
-    def _safe_price(value: Any) -> float:
+    def _safe_price(
+        value: Any,
+    ) -> float:
+        """Convert stored price text or numbers to float."""
+
         if value is None:
             return 0.0
 
-        if isinstance(value, (int, float)):
+        if isinstance(
+            value,
+            (int, float),
+        ):
             return float(value)
 
         text = str(value).strip()
@@ -1027,17 +1265,29 @@ class Database:
         cleaned = "".join(
             character
             for character in text
-            if character.isdigit()
-            or character in {".", ","}
+            if (
+                character.isdigit()
+                or character in {".", ","}
+            )
         )
 
         if not cleaned:
             return 0.0
 
-        if "," in cleaned and "." in cleaned:
-            cleaned = cleaned.replace(",", "")
+        if (
+            "," in cleaned
+            and "." in cleaned
+        ):
+            cleaned = cleaned.replace(
+                ",",
+                "",
+            )
+
         elif "," in cleaned:
-            cleaned = cleaned.replace(",", ".")
+            cleaned = cleaned.replace(
+                ",",
+                ".",
+            )
 
         try:
             return float(cleaned)
@@ -1045,7 +1295,9 @@ class Database:
         except ValueError:
             return 0.0
 
-    def __enter__(self) -> Database:
+    def __enter__(
+        self,
+    ) -> Database:
         return self
 
     def __exit__(
