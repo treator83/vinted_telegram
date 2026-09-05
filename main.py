@@ -25,13 +25,7 @@ LOGGER = logging.getLogger(__name__)
 STOP_EVENT = threading.Event()
 
 PRICE_TOLERANCE = 0.005
-
-# Number of stored listings checked directly on Vinted
-# after each normal catalogue monitoring cycle.
 STATUS_CHECK_BATCH_SIZE = 10
-
-# Small delay between direct item-page checks to reduce load
-# and avoid sending many requests to Vinted at once.
 STATUS_CHECK_DELAY = 1.0
 
 
@@ -98,9 +92,7 @@ class VintedAgent:
                     "Unexpected monitoring cycle failure"
                 )
 
-            elapsed = (
-                time.monotonic() - cycle_started
-            )
+            elapsed = time.monotonic() - cycle_started
 
             LOGGER.info(
                 "Cycle completed in %.2f seconds; "
@@ -178,9 +170,13 @@ class VintedAgent:
             search.name,
         )
 
-        listings = self.scraper.fetch(
+        # scraper.open() receives the URL.
+        self.scraper.open(
             search.url
         )
+
+        # scraper.fetch() parses the page already opened.
+        listings = self.scraper.fetch()
 
         stats.listings_found += len(
             listings
@@ -242,7 +238,7 @@ class VintedAgent:
         """
         Process one allowed listing.
 
-        Returns True only when the listing is newly discovered.
+        Returns True only for newly discovered listings.
         """
 
         stored = self.database.get(
@@ -273,8 +269,7 @@ class VintedAgent:
 
             else:
                 LOGGER.warning(
-                    "New-listing notification failed "
-                    "for %s",
+                    "New-listing notification failed for %s",
                     listing.id,
                 )
 
@@ -294,9 +289,7 @@ class VintedAgent:
             new_price - old_price
         )
 
-        if abs(
-            difference
-        ) < PRICE_TOLERANCE:
+        if abs(difference) < PRICE_TOLERANCE:
             return False
 
         updated = self.database.update_price(
@@ -328,8 +321,7 @@ class VintedAgent:
 
             else:
                 LOGGER.warning(
-                    "Price-drop notification failed "
-                    "for %s",
+                    "Price-drop notification failed for %s",
                     listing.id,
                 )
 
@@ -354,8 +346,8 @@ class VintedAgent:
         """
         Check stored item pages for availability.
 
-        A listing is never marked sold simply because it disappears
-        from the first catalogue page. Its item URL is checked directly.
+        Listings are checked directly instead of assuming that
+        disappearing from catalogue results means sold.
         """
 
         try:
@@ -382,8 +374,7 @@ class VintedAgent:
             return
 
         LOGGER.info(
-            "Checking availability of %d "
-            "stored listings",
+            "Checking availability of %d stored listings",
             len(listings),
         )
 
@@ -410,10 +401,7 @@ class VintedAgent:
 
                 stats.status_checks += 1
 
-                if (
-                    result.status
-                    == ListingStatus.UNKNOWN
-                ):
+                if result.status == ListingStatus.UNKNOWN:
                     stats.status_failures += 1
 
                     LOGGER.debug(
@@ -422,10 +410,9 @@ class VintedAgent:
                         stored["title"],
                     )
 
-                elif (
-                    result.status
-                    == ListingStatus.SOLD
-                ):
+                    continue
+
+                if result.status == ListingStatus.SOLD:
                     changed = (
                         self.database
                         .set_listing_status(
@@ -446,10 +433,7 @@ class VintedAgent:
                             ),
                         )
 
-                elif (
-                    result.status
-                    == ListingStatus.NOT_FOUND
-                ):
+                elif result.status == ListingStatus.NOT_FOUND:
                     changed = (
                         self.database
                         .set_listing_status(
@@ -467,10 +451,7 @@ class VintedAgent:
                             stored["title"],
                         )
 
-                elif (
-                    result.status
-                    == ListingStatus.ACTIVE
-                ):
+                elif result.status == ListingStatus.ACTIVE:
                     changed = (
                         self.database
                         .set_listing_status(
@@ -490,8 +471,7 @@ class VintedAgent:
                 stats.status_failures += 1
 
                 LOGGER.exception(
-                    "Status check failed for "
-                    "listing %s",
+                    "Status check failed for listing %s",
                     listing_id,
                 )
 
@@ -713,8 +693,7 @@ class VintedAgent:
 
                 LOGGER.info(
                     "%s | total=%d | sold=%d | "
-                    "rate=%.1f%% | avg=%s | "
-                    "days=%s",
+                    "rate=%.1f%% | avg=%s | days=%s",
                     row["search_name"]
                     or "Unknown",
                     total,
