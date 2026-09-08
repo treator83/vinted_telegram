@@ -3,33 +3,45 @@
     "id": "rst_boots",
     "name": "RST Boots",
     "url": "https://www.vinted.co.uk/catalog?search_text=RST%20boots&order=newest_first&page=1",
-    "max_price": 80,
+    "max_price": 40,
     "keywords": [
       "rst"
     ],
     "sizes": [
-      "9",
-      "10"
+      
     ],
     "conditions": [
-      "Very Good",
-      "Good"
+     
     ]
   },
   {
     "id": "alpinestars_boots",
     "name": "Alpinestars Boots",
     "url": "https://www.vinted.co.uk/catalog?search_text=alpinestars%20boots&order=newest_first&page=1",
-    "max_price": 120,
+    "max_price": 40,
     "keywords": [
       "alpinestars"
     ],
     "sizes": [
-      "9"
+      
     ],
     "conditions": [
-      "Very Good",
-      "Good"
+     
+    ]
+  }
+  {
+    "id": "climbing shoes",
+    "name": "All",
+    "url": "https://www.vinted.co.uk/catalog?search_text=bouldering%20climbing%20shoes&search_id=2924562074",
+    "max_price": 20,
+    "keywords": [
+      
+    ],
+    "sizes": [
+      
+    ],
+    "conditions": [
+     
     ]
   }
 ]
