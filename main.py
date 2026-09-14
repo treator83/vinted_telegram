@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import threading
@@ -32,6 +33,7 @@ STOP_EVENT = threading.Event()
 PRICE_TOLERANCE = 0.005
 STATUS_CHECK_BATCH_SIZE = 10
 STATUS_CHECK_DELAY = 1.0
+NOTIFICATION_BATCH_SIZE = 20
 
 
 @dataclass(slots=True)
@@ -54,6 +56,9 @@ class CycleStats:
     unavailable_detected: int = 0
     status_failures: int = 0
     enriched_listings: int = 0
+
+    notifications_sent: int = 0
+    notification_failures: int = 0
 
 
 class VintedAgent:
@@ -117,6 +122,12 @@ class VintedAgent:
 
         stats = CycleStats()
 
+        # Retry any durable Telegram notifications left from a
+        # previous cycle before doing new scraping work.
+        self._process_notification_queue(
+            stats
+        )
+
         try:
             searches = self.search_manager.load()
 
@@ -157,6 +168,12 @@ class VintedAgent:
 
         if not STOP_EVENT.is_set():
             self._check_listing_statuses(
+                stats
+            )
+
+        if not STOP_EVENT.is_set():
+            # Deliver notifications queued during this cycle.
+            self._process_notification_queue(
                 stats
             )
 
@@ -294,25 +311,18 @@ class VintedAgent:
                 )
                 return True
 
-            notification_sent = (
-                self.telegram.send_listing(
-                    listing
-                )
+            self.database.enqueue_notification(
+                listing.id,
+                "new_listing",
+                payload=listing.to_dict(),
             )
 
-            if notification_sent:
-                LOGGER.info(
-                    "NEW | %s | %s | %s",
-                    listing.search_name,
-                    listing.title,
-                    listing.price,
-                )
-
-            else:
-                LOGGER.warning(
-                    "New-listing notification failed for %s",
-                    listing.id,
-                )
+            LOGGER.info(
+                "QUEUED NEW | %s | %s | %s",
+                listing.search_name,
+                listing.title,
+                listing.price,
+            )
 
             return True
 
@@ -343,28 +353,21 @@ class VintedAgent:
         if difference < 0:
             stats.price_drops += 1
 
-            notification_sent = (
-                self.telegram.send_price_drop(
-                    listing,
-                    old_price,
-                )
+            self.database.enqueue_notification(
+                listing.id,
+                "price_drop",
+                old_price=old_price,
+                payload=listing.to_dict(),
             )
 
-            if notification_sent:
-                LOGGER.info(
-                    "PRICE DROP | %s | %s | "
-                    "£%.2f -> £%.2f",
-                    listing.search_name,
-                    listing.title,
-                    old_price,
-                    new_price,
-                )
-
-            else:
-                LOGGER.warning(
-                    "Price-drop notification failed for %s",
-                    listing.id,
-                )
+            LOGGER.info(
+                "QUEUED PRICE DROP | %s | %s | "
+                "£%.2f -> £%.2f",
+                listing.search_name,
+                listing.title,
+                old_price,
+                new_price,
+            )
 
         else:
             stats.price_increases += 1
@@ -612,6 +615,16 @@ class VintedAgent:
         )
 
         LOGGER.info(
+            "Telegram sent     : %d",
+            stats.notifications_sent,
+        )
+
+        LOGGER.info(
+            "Telegram failures : %d",
+            stats.notification_failures,
+        )
+
+        LOGGER.info(
             "Database size     : %d",
             self.database.count(),
         )
@@ -814,6 +827,356 @@ class VintedAgent:
 
         LOGGER.info(
             "Vinted Agent stopped"
+        )
+
+    def _process_notification_queue(
+        self,
+        stats: CycleStats,
+    ) -> None:
+        """
+        Deliver pending Telegram notifications.
+
+        Queue rows are durable in SQLite.  Failed sends remain in the queue
+        and are retried on the next monitoring cycle instead of being lost.
+        """
+
+        try:
+            pending = (
+                self.database
+                .pending_notifications(
+                    NOTIFICATION_BATCH_SIZE
+                )
+            )
+
+        except Exception:
+            stats.notification_failures += 1
+
+            LOGGER.exception(
+                "Unable to load Telegram notification queue"
+            )
+
+            return
+
+        if not pending:
+            return
+
+        LOGGER.info(
+            "Processing %d queued Telegram notifications",
+            len(pending),
+        )
+
+        for row in pending:
+            if STOP_EVENT.is_set():
+                return
+
+            notification_id = int(
+                row["id"]
+            )
+
+            notification_type = str(
+                row["notification_type"]
+                or ""
+            ).strip()
+
+            try:
+                listing = (
+                    self._listing_from_notification(
+                        row
+                    )
+                )
+
+                if notification_type == "new_listing":
+                    sent = (
+                        self.telegram
+                        .send_listing(
+                            listing
+                        )
+                    )
+
+                elif notification_type == "price_drop":
+                    old_price = float(
+                        row["old_price"]
+                        or 0.0
+                    )
+
+                    sent = (
+                        self.telegram
+                        .send_price_drop(
+                            listing,
+                            old_price,
+                        )
+                    )
+
+                else:
+                    raise ValueError(
+                        "Unsupported notification type: "
+                        f"{notification_type}"
+                    )
+
+                if sent:
+                    self.database.mark_notification_sent(
+                        notification_id
+                    )
+
+                    stats.notifications_sent += 1
+
+                    LOGGER.info(
+                        "TELEGRAM SENT | %s | %s | attempt=%d",
+                        notification_type,
+                        listing.id,
+                        int(
+                            row["attempts"]
+                            or 0
+                        ) + 1,
+                    )
+
+                else:
+                    self.database.mark_notification_failed(
+                        notification_id,
+                        "Telegram API send returned false",
+                    )
+
+                    stats.notification_failures += 1
+
+                    LOGGER.warning(
+                        "TELEGRAM RETRY PENDING | %s | %s | attempt=%d",
+                        notification_type,
+                        listing.id,
+                        int(
+                            row["attempts"]
+                            or 0
+                        ) + 1,
+                    )
+
+            except Exception as exc:
+                stats.notification_failures += 1
+
+                LOGGER.exception(
+                    "Unable to deliver queued Telegram "
+                    "notification %s",
+                    notification_id,
+                )
+
+                try:
+                    self.database.mark_notification_failed(
+                        notification_id,
+                        str(exc),
+                    )
+
+                except Exception:
+                    LOGGER.exception(
+                        "Unable to record notification failure %s",
+                        notification_id,
+                    )
+
+    @staticmethod
+    def _listing_from_notification(
+        row: object,
+    ) -> Listing:
+        """
+        Rebuild the listing snapshot saved with a notification.
+
+        The payload snapshot is preferred so a delayed price-drop alert keeps
+        the exact title/price/image values from the event that created it.
+        """
+
+        payload: dict[str, object] = {}
+
+        try:
+            raw_payload = row[
+                "payload_json"
+            ]  # type: ignore[index]
+
+            if raw_payload:
+                decoded = json.loads(
+                    str(raw_payload)
+                )
+
+                if isinstance(
+                    decoded,
+                    dict,
+                ):
+                    payload = decoded
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            IndexError,
+            json.JSONDecodeError,
+        ):
+            payload = {}
+
+        def value(
+            name: str,
+            fallback: object = "",
+        ) -> object:
+            if name in payload:
+                return payload[
+                    name
+                ]
+
+            try:
+                stored_value = row[
+                    name
+                ]  # type: ignore[index]
+
+                if stored_value is not None:
+                    return stored_value
+
+            except (
+                KeyError,
+                TypeError,
+                IndexError,
+            ):
+                pass
+
+            return fallback
+
+        pictures = value(
+            "pictures",
+            [],
+        )
+
+        if not isinstance(
+            pictures,
+            list,
+        ):
+            pictures = []
+
+        return Listing(
+            id=str(
+                value(
+                    "id",
+                    value(
+                        "listing_id",
+                        "",
+                    ),
+                )
+            ),
+            title=str(
+                value(
+                    "title",
+                    "",
+                )
+                or ""
+            ),
+            subtitle=str(
+                value(
+                    "subtitle",
+                    "",
+                )
+                or ""
+            ),
+            price=str(
+                value(
+                    "price",
+                    "",
+                )
+                or ""
+            ),
+            total_price=str(
+                value(
+                    "total_price",
+                    "",
+                )
+                or ""
+            ),
+            url=str(
+                value(
+                    "url",
+                    "",
+                )
+                or ""
+            ),
+            image=str(
+                value(
+                    "image",
+                    "",
+                )
+                or ""
+            ),
+            search_id=(
+                str(
+                    value(
+                        "search_id",
+                        "",
+                    )
+                )
+                or None
+            ),
+            search_name=(
+                str(
+                    value(
+                        "search_name",
+                        "",
+                    )
+                )
+                or None
+            ),
+            size=(
+                str(
+                    value(
+                        "size",
+                        "",
+                    )
+                )
+                or None
+            ),
+            condition=(
+                str(
+                    value(
+                        "condition",
+                        "",
+                    )
+                )
+                or None
+            ),
+            brand=(
+                str(
+                    value(
+                        "brand",
+                        "",
+                    )
+                )
+                or None
+            ),
+            description=(
+                str(
+                    value(
+                        "description",
+                        "",
+                    )
+                )
+                or None
+            ),
+            pictures=[
+                str(
+                    picture
+                )
+                for picture in pictures
+                if str(
+                    picture
+                ).strip()
+            ],
+            posted_at=(
+                str(
+                    value(
+                        "posted_at",
+                        "",
+                    )
+                )
+                or None
+            ),
+            local_image_path=(
+                str(
+                    value(
+                        "local_image_path",
+                        "",
+                    )
+                )
+                or None
+            ),
         )
 
     def _inspect_new_listing(
