@@ -177,8 +177,12 @@ def get_statistics() -> dict:
                         )
                     )
                     -
-                    JULIANDAY(\n                            COALESCE(\n                                posted_at,\n                                first_seen\n                            )\n                        )
-                ) AS value
+                    JULIANDAY(
+                        COALESCE(
+                            posted_at,
+                            first_seen
+                        )
+                    )                ) AS value
 
             FROM listings
 
