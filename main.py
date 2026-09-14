@@ -16,7 +16,12 @@ from models import Listing
 from scraper import VintedScraper
 from search import Search
 from search_manager import SearchManager
-from status_checker import ListingStatus, ListingStatusChecker
+from status_checker import (
+    ListingDetails,
+    ListingStatus,
+    ListingStatusChecker,
+    StatusResult,
+)
 from telegram_client import TelegramClient
 
 
@@ -48,6 +53,7 @@ class CycleStats:
     sold_detected: int = 0
     unavailable_detected: int = 0
     status_failures: int = 0
+    enriched_listings: int = 0
 
 
 class VintedAgent:
@@ -58,7 +64,9 @@ class VintedAgent:
         self.scraper = VintedScraper()
         self.telegram = TelegramClient()
         self.search_manager = SearchManager()
-        self.status_checker = ListingStatusChecker()
+        self.status_checker = ListingStatusChecker(
+            browser=self.scraper.browser
+        )
 
         self.started = False
 
@@ -207,6 +215,7 @@ class VintedAgent:
                 is_new = self._process_listing(
                     listing,
                     stats,
+                    search,
                 )
 
                 if is_new:
@@ -234,6 +243,7 @@ class VintedAgent:
         self,
         listing: Listing,
         stats: CycleStats,
+        search: Search,
     ) -> bool:
         """
         Process one allowed listing.
@@ -246,12 +256,43 @@ class VintedAgent:
         )
 
         if stored is None:
+            inspection = self._inspect_new_listing(
+                listing,
+                stats,
+            )
+
             inserted = self.database.save(
-                listing
+                listing,
+                search_config=self._search_config(
+                    search
+                ),
             )
 
             if not inserted:
                 return False
+
+            if inspection is not None:
+                self.database.set_listing_status(
+                    listing.id,
+                    inspection.status.value,
+                    reason=inspection.reason,
+                )
+
+            if (
+                inspection is not None
+                and inspection.status
+                in {
+                    ListingStatus.SOLD,
+                    ListingStatus.NOT_FOUND,
+                }
+            ):
+                LOGGER.info(
+                    "NEW BUT UNAVAILABLE | %s | %s | %s",
+                    listing.search_name,
+                    listing.title,
+                    inspection.reason,
+                )
+                return True
 
             notification_sent = (
                 self.telegram.send_listing(
@@ -401,13 +442,29 @@ class VintedAgent:
 
                 stats.status_checks += 1
 
+                if self._details_present(
+                    result.details
+                ):
+                    self._persist_details(
+                        listing_id,
+                        result.details,
+                    )
+                    stats.enriched_listings += 1
+
                 if result.status == ListingStatus.UNKNOWN:
                     stats.status_failures += 1
 
+                    self.database.set_listing_status(
+                        listing_id,
+                        ListingStatus.UNKNOWN.value,
+                        reason=result.reason,
+                    )
+
                     LOGGER.debug(
-                        "UNKNOWN STATUS | %s | %s",
+                        "UNKNOWN STATUS | %s | %s | %s",
                         listing_id,
                         stored["title"],
+                        result.reason,
                     )
 
                     continue
@@ -418,6 +475,7 @@ class VintedAgent:
                         .set_listing_status(
                             listing_id,
                             ListingStatus.SOLD.value,
+                            reason=result.reason,
                         )
                     )
 
@@ -439,6 +497,7 @@ class VintedAgent:
                         .set_listing_status(
                             listing_id,
                             ListingStatus.NOT_FOUND.value,
+                            reason=result.reason,
                         )
                     )
 
@@ -457,6 +516,7 @@ class VintedAgent:
                         .set_listing_status(
                             listing_id,
                             ListingStatus.ACTIVE.value,
+                            reason=result.reason,
                         )
                     )
 
@@ -544,6 +604,11 @@ class VintedAgent:
         LOGGER.info(
             "Status failures   : %d",
             stats.status_failures,
+        )
+
+        LOGGER.info(
+            "Enriched records  : %d",
+            stats.enriched_listings,
         )
 
         LOGGER.info(
@@ -750,6 +815,133 @@ class VintedAgent:
         LOGGER.info(
             "Vinted Agent stopped"
         )
+
+    def _inspect_new_listing(
+        self,
+        listing: Listing,
+        stats: CycleStats,
+    ) -> StatusResult | None:
+        """Inspect and enrich a newly discovered catalogue listing."""
+
+        try:
+            result = self.status_checker.check(
+                listing.url
+            )
+
+            stats.status_checks += 1
+
+            if self._details_present(
+                result.details
+            ):
+                self._apply_details_to_listing(
+                    listing,
+                    result.details,
+                )
+                stats.enriched_listings += 1
+
+            if result.status == ListingStatus.UNKNOWN:
+                stats.status_failures += 1
+
+            return result
+
+        except Exception:
+            stats.status_failures += 1
+
+            LOGGER.exception(
+                "Unable to inspect new listing %s",
+                listing.id,
+            )
+
+            return None
+
+    def _persist_details(
+        self,
+        listing_id: str,
+        details: ListingDetails,
+    ) -> None:
+        """Persist item-page enrichment without overwriting useful data."""
+
+        self.database.update_listing_details(
+            listing_id,
+            size=details.size,
+            condition=details.condition,
+            brand=details.brand,
+            description=details.description,
+            pictures=(
+                details.pictures
+                if details.pictures
+                else None
+            ),
+            posted_at=details.posted_at,
+        )
+
+    @staticmethod
+    def _apply_details_to_listing(
+        listing: Listing,
+        details: ListingDetails,
+    ) -> None:
+        """Copy item-page details onto a Listing before first save."""
+
+        if details.size:
+            listing.size = details.size
+
+        if details.condition:
+            listing.condition = details.condition
+
+        if details.brand:
+            listing.brand = details.brand
+
+        if details.description:
+            listing.description = (
+                details.description
+            )
+
+        if details.pictures:
+            listing.pictures = list(
+                details.pictures
+            )
+
+        if details.posted_at:
+            listing.posted_at = (
+                details.posted_at
+            )
+
+    @staticmethod
+    def _details_present(
+        details: ListingDetails,
+    ) -> bool:
+        return any(
+            (
+                details.size,
+                details.condition,
+                details.brand,
+                details.description,
+                details.pictures,
+                details.posted_at,
+            )
+        )
+
+    @staticmethod
+    def _search_config(
+        search: Search,
+    ) -> dict[str, object]:
+        """Return the filter configuration used when a listing was found."""
+
+        return {
+            "id": search.id,
+            "name": search.name,
+            "url": search.url,
+            "max_price": search.max_price,
+            "keywords": list(
+                search.keywords
+            ),
+            "sizes": list(
+                search.sizes
+            ),
+            "conditions": list(
+                search.conditions
+            ),
+        }
 
     @staticmethod
     def _stored_price(
