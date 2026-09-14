@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
-from database import Database
+from database import Database, SCHEMA_VERSION
 from filters import allow
+from main import CycleStats, VintedAgent
 from models import Listing, extract_price
 from search import Search
 from search_manager import SearchConfigurationError, SearchManager
+from status_checker import ListingStatus, ListingStatusChecker
 
 
 def make_listing(
@@ -23,6 +26,11 @@ def make_listing(
     total_price: str = "£53.70",
     search_id: str = "rst_boots",
     search_name: str = "RST Boots",
+    size: str | None = None,
+    condition: str | None = None,
+    brand: str | None = None,
+    description: str | None = None,
+    posted_at: str | None = None,
 ) -> Listing:
     """Create a listing suitable for tests."""
 
@@ -36,6 +44,11 @@ def make_listing(
         image="https://example.com/image.jpg",
         search_id=search_id,
         search_name=search_name,
+        size=size,
+        condition=condition,
+        brand=brand,
+        description=description,
+        posted_at=posted_at,
     )
 
 
@@ -64,6 +77,29 @@ class PriceParsingTests(unittest.TestCase):
         self.assertEqual(listing.price_value, 64.99)
         self.assertEqual(listing.total_price_value, 69.14)
 
+    def test_listing_normalises_picture_list(self) -> None:
+        listing = Listing(
+            id="1",
+            title="Boots",
+            subtitle="",
+            price="£20",
+            total_price="£22",
+            url="https://example.com/item",
+            image="https://example.com/main.jpg",
+            pictures=[
+                "https://example.com/extra.jpg",
+                "https://example.com/extra.jpg",
+            ],
+        )
+
+        self.assertEqual(
+            listing.pictures,
+            [
+                "https://example.com/main.jpg",
+                "https://example.com/extra.jpg",
+            ],
+        )
+
 
 class FilterTests(unittest.TestCase):
     """Test search-specific listing filters."""
@@ -81,37 +117,38 @@ class FilterTests(unittest.TestCase):
 
     def test_matching_listing_is_allowed(self) -> None:
         listing = make_listing()
-
         self.assertTrue(allow(listing, self.search))
 
     def test_keyword_filter_rejects_non_matching_listing(self) -> None:
-        listing = make_listing(title="Alpinestars Motorcycle Boots")
-
+        listing = make_listing(
+            title="Alpinestars Motorcycle Boots"
+        )
         self.assertFalse(allow(listing, self.search))
 
     def test_maximum_price_filter_rejects_expensive_listing(self) -> None:
         listing = make_listing(price="£80.01")
-
         self.assertFalse(allow(listing, self.search))
 
     def test_maximum_price_is_inclusive(self) -> None:
         listing = make_listing(price="£80.00")
-
         self.assertTrue(allow(listing, self.search))
 
     def test_size_filter_rejects_wrong_size(self) -> None:
-        listing = make_listing(subtitle="Size 8 · Very Good")
-
+        listing = make_listing(
+            subtitle="Size 8 · Very Good"
+        )
         self.assertFalse(allow(listing, self.search))
 
     def test_size_filter_does_not_match_partial_number(self) -> None:
-        listing = make_listing(subtitle="Size 19 · Very Good")
-
+        listing = make_listing(
+            subtitle="Size 19 · Very Good"
+        )
         self.assertFalse(allow(listing, self.search))
 
     def test_condition_filter_rejects_wrong_condition(self) -> None:
-        listing = make_listing(subtitle="Size 9 · Satisfactory")
-
+        listing = make_listing(
+            subtitle="Size 9 · Satisfactory"
+        )
         self.assertFalse(allow(listing, self.search))
 
     def test_search_without_filters_allows_listing(self) -> None:
@@ -135,10 +172,13 @@ class SearchManagerTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary_directory.cleanup)
+        self.addCleanup(
+            self.temporary_directory.cleanup
+        )
 
         self.searches_file = (
-            Path(self.temporary_directory.name) / "searches.json"
+            Path(self.temporary_directory.name)
+            / "searches.json"
         )
 
     def test_loads_valid_search_configuration(self) -> None:
@@ -156,13 +196,27 @@ class SearchManagerTests(unittest.TestCase):
             ]
         )
 
-        searches = SearchManager(self.searches_file).load()
+        searches = SearchManager(
+            self.searches_file
+        ).load()
 
         self.assertEqual(len(searches), 1)
-        self.assertEqual(searches[0].id, "rst_boots")
-        self.assertEqual(searches[0].name, "RST Boots")
-        self.assertEqual(searches[0].max_price, 80.0)
-        self.assertEqual(searches[0].sizes, ["9", "10"])
+        self.assertEqual(
+            searches[0].id,
+            "rst_boots",
+        )
+        self.assertEqual(
+            searches[0].name,
+            "RST Boots",
+        )
+        self.assertEqual(
+            searches[0].max_price,
+            80.0,
+        )
+        self.assertEqual(
+            searches[0].sizes,
+            ["9", "10"],
+        )
 
     def test_optional_filters_default_to_empty_values(self) -> None:
         self._write_json(
@@ -175,7 +229,9 @@ class SearchManagerTests(unittest.TestCase):
             ]
         )
 
-        search = SearchManager(self.searches_file).load()[0]
+        search = SearchManager(
+            self.searches_file
+        ).load()[0]
 
         self.assertIsNone(search.max_price)
         self.assertEqual(search.keywords, [])
@@ -198,8 +254,12 @@ class SearchManagerTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaises(SearchConfigurationError):
-            SearchManager(self.searches_file).load()
+        with self.assertRaises(
+            SearchConfigurationError
+        ):
+            SearchManager(
+                self.searches_file
+            ).load()
 
     def test_invalid_json_is_rejected(self) -> None:
         self.searches_file.write_text(
@@ -207,8 +267,12 @@ class SearchManagerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaises(SearchConfigurationError):
-            SearchManager(self.searches_file).load()
+        with self.assertRaises(
+            SearchConfigurationError
+        ):
+            SearchManager(
+                self.searches_file
+            ).load()
 
     def test_missing_required_field_is_rejected(self) -> None:
         self._write_json(
@@ -220,8 +284,12 @@ class SearchManagerTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaises(SearchConfigurationError):
-            SearchManager(self.searches_file).load()
+        with self.assertRaises(
+            SearchConfigurationError
+        ):
+            SearchManager(
+                self.searches_file
+            ).load()
 
     def _write_json(self, data: object) -> None:
         self.searches_file.write_text(
@@ -230,46 +298,476 @@ class SearchManagerTests(unittest.TestCase):
         )
 
 
+class StatusCheckerTests(unittest.TestCase):
+    """Test Selenium-page status parsing and item enrichment."""
+
+    def test_detects_active_listing(self) -> None:
+        status, reason = (
+            ListingStatusChecker._detect_status(
+                '<button data-testid="item-buy-button">Buy</button>'
+            )
+        )
+
+        self.assertEqual(
+            status,
+            ListingStatus.ACTIVE,
+        )
+        self.assertEqual(
+            reason,
+            "buy_button",
+        )
+
+    def test_detects_sold_listing(self) -> None:
+        status, reason = (
+            ListingStatusChecker._detect_status(
+                '<link href="https://schema.org/OutOfStock">'
+            )
+        )
+
+        self.assertEqual(
+            status,
+            ListingStatus.SOLD,
+        )
+        self.assertEqual(
+            reason,
+            "schema_out_of_stock",
+        )
+
+    def test_detects_not_found_from_visible_page_text(self) -> None:
+        status, reason = (
+            ListingStatusChecker._detect_status(
+                "<html></html>",
+                visible_text=(
+                    "This item is no longer available"
+                ),
+            )
+        )
+
+        self.assertEqual(
+            status,
+            ListingStatus.NOT_FOUND,
+        )
+        self.assertEqual(
+            reason,
+            "not_found_page",
+        )
+
+    def test_extracts_vinted_item_details(self) -> None:
+        html = r'''
+        <script>
+        self.__next_f.push([1,
+        "{\"data\":{\"attributes\":[
+        {\"code\":\"brand\",\"data\":{\"title\":\"Brand\",\"value\":\"Alpinestars\"}},
+        {\"code\":\"size\",\"data\":{\"title\":\"Size\",\"value\":\"5\"}},
+        {\"code\":\"status\",\"data\":{\"title\":\"Condition\",\"value\":\"Good\"}},
+        {\"code\":\"upload_date\",\"data\":{\"title\":\"Uploaded\",\"value\":\"21 min ago\"}}
+        ]},
+        {\"data\":{\"description\":\"Great condition\\nSize uk 5\",\"is_expanded\":false}},
+        {\"data\":{\"item_id\":\"9879351450\",\"photos\":[
+        {\"url\":\"https://images1.vinted.net/t/a/f800/one.webp?s=1\"},
+        {\"url\":\"https://images1.vinted.net/t/b/f800/two.webp?s=2\"}
+        ],\"price\":{\"amount\":\"60\"}}}
+        "])
+        </script>
+        '''
+
+        details = (
+            ListingStatusChecker._extract_details(
+                html,
+                listing_id="9879351450",
+            )
+        )
+
+        self.assertEqual(
+            details.size,
+            "5",
+        )
+        self.assertEqual(
+            details.condition,
+            "Good",
+        )
+        self.assertEqual(
+            details.brand,
+            "Alpinestars",
+        )
+        self.assertIn(
+            "Great condition",
+            details.description or "",
+        )
+        self.assertEqual(
+            len(details.pictures),
+            2,
+        )
+        self.assertEqual(
+            details.upload_text,
+            "21 min ago",
+        )
+        self.assertIsNotNone(
+            details.posted_at
+        )
+
+    def test_converts_relative_upload_time(self) -> None:
+        timestamp = (
+            ListingStatusChecker
+            ._upload_text_to_timestamp(
+                "21 min ago",
+                now=datetime(
+                    2026,
+                    9,
+                    14,
+                    18,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            )
+        )
+
+        self.assertEqual(
+            timestamp,
+            "2026-09-14 17:39:00",
+        )
+
+
+class NotificationDeliveryTests(unittest.TestCase):
+    """Test durable Telegram queue delivery behavior."""
+
+    def test_rebuilds_listing_from_queued_snapshot(self) -> None:
+        row = {
+            "id": 99,
+            "listing_id": "123456",
+            "payload_json": json.dumps(
+                {
+                    "id": "123456",
+                    "title": "RST Boots",
+                    "subtitle": "Size 9 · Good",
+                    "price": "£35.00",
+                    "total_price": "£38.00",
+                    "url": "https://example.com/item/123456",
+                    "image": "https://example.com/image.jpg",
+                    "search_id": "rst_boots",
+                    "search_name": "RST Boots",
+                    "size": "9",
+                    "condition": "Good",
+                    "brand": "RST",
+                    "description": "Used boots",
+                    "pictures": [
+                        "https://example.com/image.jpg"
+                    ],
+                }
+            ),
+        }
+
+        listing = (
+            VintedAgent
+            ._listing_from_notification(
+                row
+            )
+        )
+
+        self.assertEqual(
+            listing.id,
+            "123456",
+        )
+        self.assertEqual(
+            listing.price,
+            "£35.00",
+        )
+        self.assertEqual(
+            listing.brand,
+            "RST",
+        )
+
+    def test_successful_notification_is_marked_sent(self) -> None:
+        class FakeDatabase:
+            def __init__(self) -> None:
+                self.sent: list[int] = []
+                self.failed: list[int] = []
+
+            def pending_notifications(
+                self,
+                limit: int,
+            ) -> list[dict]:
+                return [
+                    {
+                        "id": 7,
+                        "listing_id": "123456",
+                        "notification_type": "new_listing",
+                        "old_price": None,
+                        "payload_json": json.dumps(
+                            make_listing().to_dict()
+                        ),
+                        "attempts": 1,
+                    }
+                ]
+
+            def mark_notification_sent(
+                self,
+                notification_id: int,
+            ) -> None:
+                self.sent.append(
+                    notification_id
+                )
+
+            def mark_notification_failed(
+                self,
+                notification_id: int,
+                error: str,
+            ) -> None:
+                self.failed.append(
+                    notification_id
+                )
+
+        class FakeTelegram:
+            def send_listing(
+                self,
+                listing: Listing,
+            ) -> bool:
+                return True
+
+            def send_price_drop(
+                self,
+                listing: Listing,
+                old_price: float,
+            ) -> bool:
+                return True
+
+        agent = VintedAgent.__new__(
+            VintedAgent
+        )
+        agent.database = FakeDatabase()
+        agent.telegram = FakeTelegram()
+
+        stats = CycleStats()
+
+        agent._process_notification_queue(
+            stats
+        )
+
+        self.assertEqual(
+            agent.database.sent,
+            [7],
+        )
+        self.assertEqual(
+            agent.database.failed,
+            [],
+        )
+        self.assertEqual(
+            stats.notifications_sent,
+            1,
+        )
+        self.assertEqual(
+            stats.notification_failures,
+            0,
+        )
+
+    def test_failed_notification_remains_retryable(self) -> None:
+        class FakeDatabase:
+            def __init__(self) -> None:
+                self.sent: list[int] = []
+                self.failed: list[int] = []
+
+            def pending_notifications(
+                self,
+                limit: int,
+            ) -> list[dict]:
+                return [
+                    {
+                        "id": 8,
+                        "listing_id": "123456",
+                        "notification_type": "price_drop",
+                        "old_price": 50.0,
+                        "payload_json": json.dumps(
+                            make_listing(
+                                price="£40.00"
+                            ).to_dict()
+                        ),
+                        "attempts": 2,
+                    }
+                ]
+
+            def mark_notification_sent(
+                self,
+                notification_id: int,
+            ) -> None:
+                self.sent.append(
+                    notification_id
+                )
+
+            def mark_notification_failed(
+                self,
+                notification_id: int,
+                error: str,
+            ) -> None:
+                self.failed.append(
+                    notification_id
+                )
+
+        class FakeTelegram:
+            def send_listing(
+                self,
+                listing: Listing,
+            ) -> bool:
+                return False
+
+            def send_price_drop(
+                self,
+                listing: Listing,
+                old_price: float,
+            ) -> bool:
+                return False
+
+        agent = VintedAgent.__new__(
+            VintedAgent
+        )
+        agent.database = FakeDatabase()
+        agent.telegram = FakeTelegram()
+
+        stats = CycleStats()
+
+        agent._process_notification_queue(
+            stats
+        )
+
+        self.assertEqual(
+            agent.database.sent,
+            [],
+        )
+        self.assertEqual(
+            agent.database.failed,
+            [8],
+        )
+        self.assertEqual(
+            stats.notifications_sent,
+            0,
+        )
+        self.assertEqual(
+            stats.notification_failures,
+            1,
+        )
+
+
 class DatabaseTests(unittest.TestCase):
     """Test SQLite listing persistence and price history."""
 
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.database_path = (
-            Path(self.temporary_directory.name) / "listings.db"
+        self.temporary_directory = (
+            tempfile.TemporaryDirectory()
         )
-        self.database = Database(self.database_path)
+
+        self.database_path = (
+            Path(self.temporary_directory.name)
+            / "listings.db"
+        )
+
+        self.database = Database(
+            self.database_path
+        )
 
     def tearDown(self) -> None:
         self.database.close()
         self.temporary_directory.cleanup()
 
-    def test_saves_and_reads_listing(self) -> None:
-        listing = make_listing()
+    def test_schema_version_is_current(self) -> None:
+        version = self.database.connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
 
-        inserted = self.database.save(listing)
-        stored = self.database.get(listing.id)
+        self.assertEqual(
+            version,
+            SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            SCHEMA_VERSION,
+            5,
+        )
+
+    def test_saves_and_reads_listing(self) -> None:
+        listing = make_listing(
+            size="9",
+            condition="Very Good",
+            brand="RST",
+            description="Motorcycle boots",
+            posted_at="2026-09-10 10:00:00",
+        )
+
+        inserted = self.database.save(
+            listing,
+            search_config={
+                "id": "rst_boots",
+                "max_price": 40,
+            },
+        )
+
+        stored = self.database.get(
+            listing.id
+        )
 
         self.assertTrue(inserted)
         self.assertIsNotNone(stored)
-        self.assertEqual(stored["id"], listing.id)
-        self.assertEqual(stored["title"], listing.title)
-        self.assertEqual(stored["current_price"], 50.0)
-        self.assertEqual(self.database.count(), 1)
+        self.assertEqual(
+            stored["id"],
+            listing.id,
+        )
+        self.assertEqual(
+            stored["title"],
+            listing.title,
+        )
+        self.assertEqual(
+            stored["current_price"],
+            50.0,
+        )
+        self.assertEqual(
+            stored["size"],
+            "9",
+        )
+        self.assertEqual(
+            stored["item_condition"],
+            "Very Good",
+        )
+        self.assertEqual(
+            stored["brand"],
+            "RST",
+        )
+        self.assertEqual(
+            stored["description"],
+            "Motorcycle boots",
+        )
+        self.assertEqual(
+            stored["posted_at"],
+            "2026-09-10 10:00:00",
+        )
+        self.assertIsNotNone(
+            stored["search_config_hash"]
+        )
+        self.assertEqual(
+            self.database.count(),
+            1,
+        )
 
     def test_duplicate_listing_is_not_inserted_twice(self) -> None:
         listing = make_listing()
 
-        self.assertTrue(self.database.save(listing))
-        self.assertFalse(self.database.save(listing))
-        self.assertEqual(self.database.count(), 1)
+        self.assertTrue(
+            self.database.save(listing)
+        )
+        self.assertFalse(
+            self.database.save(listing)
+        )
+        self.assertEqual(
+            self.database.count(),
+            1,
+        )
 
     def test_exists_detects_stored_listing(self) -> None:
         listing = make_listing()
         self.database.save(listing)
 
-        self.assertTrue(self.database.exists(listing.id))
-        self.assertFalse(self.database.exists("not-present"))
+        self.assertTrue(
+            self.database.exists(listing.id)
+        )
+        self.assertFalse(
+            self.database.exists("not-present")
+        )
 
     def test_count_for_search(self) -> None:
         first = make_listing(
@@ -291,51 +789,292 @@ class DatabaseTests(unittest.TestCase):
         self.database.save(third)
 
         self.assertEqual(
-            self.database.count_for_search("RST Boots"),
+            self.database.count_for_search(
+                "RST Boots"
+            ),
             2,
         )
         self.assertEqual(
-            self.database.count_for_search("Alpinestars Boots"),
+            self.database.count_for_search(
+                "Alpinestars Boots"
+            ),
             1,
         )
 
     def test_updates_price_and_records_history(self) -> None:
-        original = make_listing(price="£50.00")
-        updated = make_listing(price="£40.00")
+        original = make_listing(
+            price="£50.00"
+        )
+        updated = make_listing(
+            price="£40.00"
+        )
 
         self.database.save(original)
-        price_changed = self.database.update_price(updated)
 
-        stored = self.database.get(updated.id)
-        history = self.database.price_history(updated.id)
+        price_changed = (
+            self.database.update_price(
+                updated
+            )
+        )
+
+        stored = self.database.get(
+            updated.id
+        )
+        history = self.database.price_history(
+            updated.id
+        )
 
         self.assertTrue(price_changed)
-        self.assertEqual(stored["previous_price"], 50.0)
-        self.assertEqual(stored["current_price"], 40.0)
         self.assertEqual(
-            [row["price"] for row in history],
+            stored["previous_price"],
+            50.0,
+        )
+        self.assertEqual(
+            stored["current_price"],
+            40.0,
+        )
+        self.assertEqual(
+            [
+                row["price"]
+                for row in history
+            ],
             [50.0, 40.0],
         )
 
     def test_unchanged_price_does_not_add_history_entry(self) -> None:
-        listing = make_listing(price="£50.00")
+        listing = make_listing(
+            price="£50.00"
+        )
 
         self.database.save(listing)
-        price_changed = self.database.update_price(listing)
 
-        history = self.database.price_history(listing.id)
+        price_changed = (
+            self.database.update_price(
+                listing
+            )
+        )
+
+        history = self.database.price_history(
+            listing.id
+        )
 
         self.assertFalse(price_changed)
-        self.assertEqual(len(history), 1)
+        self.assertEqual(
+            len(history),
+            1,
+        )
+
+    def test_updates_enriched_listing_details(self) -> None:
+        listing = make_listing()
+        self.database.save(listing)
+
+        updated = (
+            self.database
+            .update_listing_details(
+                listing.id,
+                size="10",
+                condition="Good",
+                brand="RST",
+                description="Used boots",
+                pictures=[
+                    "https://example.com/main.jpg",
+                    "https://example.com/second.jpg",
+                ],
+                posted_at="2026-09-11 15:00:00",
+                local_image_path="data/images/123456.jpg",
+            )
+        )
+
+        stored = self.database.get(
+            listing.id
+        )
+
+        self.assertTrue(updated)
+        self.assertEqual(
+            stored["size"],
+            "10",
+        )
+        self.assertEqual(
+            stored["item_condition"],
+            "Good",
+        )
+        self.assertEqual(
+            stored["brand"],
+            "RST",
+        )
+        self.assertEqual(
+            stored["description"],
+            "Used boots",
+        )
+        self.assertEqual(
+            stored["posted_at"],
+            "2026-09-11 15:00:00",
+        )
+        self.assertEqual(
+            stored["local_image_path"],
+            "data/images/123456.jpg",
+        )
+
+        pictures = json.loads(
+            stored["pictures_json"]
+        )
+
+        self.assertIn(
+            "https://example.com/second.jpg",
+            pictures,
+        )
+
+    def test_touch_reactivates_listing(self) -> None:
+        listing = make_listing()
+        self.database.save(listing)
+
+        self.database.set_listing_status(
+            listing.id,
+            "sold",
+            reason="explicit_sold",
+        )
+
+        self.database.touch(
+            listing.id
+        )
+
+        stored = self.database.get(
+            listing.id
+        )
+
+        self.assertEqual(
+            stored["listing_status"],
+            "active",
+        )
+        self.assertEqual(
+            stored["status_reason"],
+            "catalogue",
+        )
+        self.assertIsNone(
+            stored["sold_at"]
+        )
+
+    def test_status_reason_is_stored(self) -> None:
+        listing = make_listing()
+        self.database.save(listing)
+
+        changed = (
+            self.database
+            .set_listing_status(
+                listing.id,
+                "not_found",
+                reason="http_404",
+            )
+        )
+
+        stored = self.database.get(
+            listing.id
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            stored["listing_status"],
+            "not_found",
+        )
+        self.assertEqual(
+            stored["status_reason"],
+            "http_404",
+        )
+        self.assertIsNotNone(
+            stored["sold_at"]
+        )
+
+    def test_notification_queue_lifecycle(self) -> None:
+        listing = make_listing()
+        self.database.save(listing)
+
+        notification_id = (
+            self.database
+            .enqueue_notification(
+                listing.id,
+                "new_listing",
+            )
+        )
+
+        pending = (
+            self.database
+            .pending_notifications()
+        )
+
+        self.assertEqual(
+            len(pending),
+            1,
+        )
+        self.assertEqual(
+            pending[0]["id"],
+            notification_id,
+        )
+        self.assertEqual(
+            pending[0]["state"],
+            "pending",
+        )
+
+        self.database.mark_notification_failed(
+            notification_id,
+            "temporary error",
+        )
+
+        failed = (
+            self.database
+            .pending_notifications()
+        )
+
+        self.assertEqual(
+            failed[0]["state"],
+            "failed",
+        )
+        self.assertEqual(
+            failed[0]["attempts"],
+            1,
+        )
+
+        self.database.mark_notification_sent(
+            notification_id
+        )
+
+        self.assertEqual(
+            self.database.pending_notifications(),
+            [],
+        )
+
+        stored = self.database.get(
+            listing.id
+        )
+
+        self.assertIsNotNone(
+            stored["notified_at"]
+        )
 
     def test_clear_removes_all_data(self) -> None:
         listing = make_listing()
         self.database.save(listing)
 
+        self.database.enqueue_notification(
+            listing.id,
+            "new_listing",
+        )
+
         self.database.clear()
 
-        self.assertEqual(self.database.count(), 0)
-        self.assertEqual(self.database.price_history(listing.id), [])
+        self.assertEqual(
+            self.database.count(),
+            0,
+        )
+        self.assertEqual(
+            self.database.price_history(
+                listing.id
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.database.pending_notifications(),
+            [],
+        )
 
 
 if __name__ == "__main__":
