@@ -207,11 +207,13 @@ class ListingStatusChecker:
             or details.condition
         )
 
+        # Prefer the structured Next.js value because the rendered DOM can
+        # append UI text such as "... more" to a collapsed description.
         description = (
-            self._dom_text(
+            details.description
+            or self._dom_text(
                 '[itemprop="description"]'
             )
-            or details.description
         )
 
         upload_text = (
