@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from database import Database, SCHEMA_VERSION
@@ -12,6 +13,7 @@ from filters import allow
 from models import Listing, extract_price
 from search import Search
 from search_manager import SearchConfigurationError, SearchManager
+from status_checker import ListingStatus, ListingStatusChecker
 
 
 def make_listing(
@@ -292,6 +294,136 @@ class SearchManagerTests(unittest.TestCase):
         self.searches_file.write_text(
             json.dumps(data),
             encoding="utf-8",
+        )
+
+
+class StatusCheckerTests(unittest.TestCase):
+    """Test Selenium-page status parsing and item enrichment."""
+
+    def test_detects_active_listing(self) -> None:
+        status, reason = (
+            ListingStatusChecker._detect_status(
+                '<button data-testid="item-buy-button">Buy</button>'
+            )
+        )
+
+        self.assertEqual(
+            status,
+            ListingStatus.ACTIVE,
+        )
+        self.assertEqual(
+            reason,
+            "buy_button",
+        )
+
+    def test_detects_sold_listing(self) -> None:
+        status, reason = (
+            ListingStatusChecker._detect_status(
+                '<link href="https://schema.org/OutOfStock">'
+            )
+        )
+
+        self.assertEqual(
+            status,
+            ListingStatus.SOLD,
+        )
+        self.assertEqual(
+            reason,
+            "schema_out_of_stock",
+        )
+
+    def test_detects_not_found_from_visible_page_text(self) -> None:
+        status, reason = (
+            ListingStatusChecker._detect_status(
+                "<html></html>",
+                visible_text=(
+                    "This item is no longer available"
+                ),
+            )
+        )
+
+        self.assertEqual(
+            status,
+            ListingStatus.NOT_FOUND,
+        )
+        self.assertEqual(
+            reason,
+            "not_found_page",
+        )
+
+    def test_extracts_vinted_item_details(self) -> None:
+        html = r'''
+        <script>
+        self.__next_f.push([1,
+        "{\"data\":{\"attributes\":[
+        {\"code\":\"brand\",\"data\":{\"title\":\"Brand\",\"value\":\"Alpinestars\"}},
+        {\"code\":\"size\",\"data\":{\"title\":\"Size\",\"value\":\"5\"}},
+        {\"code\":\"status\",\"data\":{\"title\":\"Condition\",\"value\":\"Good\"}},
+        {\"code\":\"upload_date\",\"data\":{\"title\":\"Uploaded\",\"value\":\"21 min ago\"}}
+        ]},
+        {\"data\":{\"description\":\"Great condition\\nSize uk 5\",\"is_expanded\":false}},
+        {\"data\":{\"item_id\":\"9879351450\",\"photos\":[
+        {\"url\":\"https://images1.vinted.net/t/a/f800/one.webp?s=1\"},
+        {\"url\":\"https://images1.vinted.net/t/b/f800/two.webp?s=2\"}
+        ],\"price\":{\"amount\":\"60\"}}}
+        "])
+        </script>
+        '''
+
+        details = (
+            ListingStatusChecker._extract_details(
+                html,
+                listing_id="9879351450",
+            )
+        )
+
+        self.assertEqual(
+            details.size,
+            "5",
+        )
+        self.assertEqual(
+            details.condition,
+            "Good",
+        )
+        self.assertEqual(
+            details.brand,
+            "Alpinestars",
+        )
+        self.assertIn(
+            "Great condition",
+            details.description or "",
+        )
+        self.assertEqual(
+            len(details.pictures),
+            2,
+        )
+        self.assertEqual(
+            details.upload_text,
+            "21 min ago",
+        )
+        self.assertIsNotNone(
+            details.posted_at
+        )
+
+    def test_converts_relative_upload_time(self) -> None:
+        timestamp = (
+            ListingStatusChecker
+            ._upload_text_to_timestamp(
+                "21 min ago",
+                now=datetime(
+                    2026,
+                    9,
+                    14,
+                    18,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            )
+        )
+
+        self.assertEqual(
+            timestamp,
+            "2026-09-14 17:39:00",
         )
 
 
