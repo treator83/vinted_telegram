@@ -1,4 +1,4 @@
-"""Send hourly Vinted market statistics to Telegram."""
+"""Send the scheduled daily Vinted market report to Telegram."""
 
 from __future__ import annotations
 
@@ -177,7 +177,7 @@ def get_statistics() -> dict:
                         )
                     )
                     -
-                    JULIANDAY(first_seen)
+                    JULIANDAY(\n                            COALESCE(\n                                posted_at,\n                                first_seen\n                            )\n                        )
                 ) AS value
 
             FROM listings
@@ -329,7 +329,7 @@ def build_message(
     )
 
     lines = [
-        "📊 VINTED HOURLY STATISTICS",
+        "📊 VINTED DAILY STATISTICS",
         "",
         f"🕐 {report_time}",
         "",
@@ -365,13 +365,13 @@ def build_message(
         is not None
     ):
         lines.append(
-            "💷 Average sold price: "
+            "💷 Average last asking price: "
             f"£{stats['average_sold_price']:.2f}"
         )
 
     else:
         lines.append(
-            "💷 Average sold price: n/a"
+            "💷 Average last asking price: n/a"
         )
 
     if (
