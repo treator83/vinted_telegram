@@ -1,0 +1,20 @@
+[Unit]
+Description=Vinted Agent Telegram Commands
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=awex
+Group=awex
+WorkingDirectory=/opt/vinted-agent
+Environment=HOME=/home/awex
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/vinted-agent/.venv/bin/python /opt/vinted-agent/telegram_commands.py
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
