@@ -10,6 +10,7 @@ from pathlib import Path
 
 from database import Database, SCHEMA_VERSION
 from filters import allow
+from main import CycleStats, VintedAgent
 from models import Listing, extract_price
 from search import Search
 from search_manager import SearchConfigurationError, SearchManager
@@ -424,6 +425,224 @@ class StatusCheckerTests(unittest.TestCase):
         self.assertEqual(
             timestamp,
             "2026-09-14 17:39:00",
+        )
+
+
+class NotificationDeliveryTests(unittest.TestCase):
+    """Test durable Telegram queue delivery behavior."""
+
+    def test_rebuilds_listing_from_queued_snapshot(self) -> None:
+        row = {
+            "id": 99,
+            "listing_id": "123456",
+            "payload_json": json.dumps(
+                {
+                    "id": "123456",
+                    "title": "RST Boots",
+                    "subtitle": "Size 9 · Good",
+                    "price": "£35.00",
+                    "total_price": "£38.00",
+                    "url": "https://example.com/item/123456",
+                    "image": "https://example.com/image.jpg",
+                    "search_id": "rst_boots",
+                    "search_name": "RST Boots",
+                    "size": "9",
+                    "condition": "Good",
+                    "brand": "RST",
+                    "description": "Used boots",
+                    "pictures": [
+                        "https://example.com/image.jpg"
+                    ],
+                }
+            ),
+        }
+
+        listing = (
+            VintedAgent
+            ._listing_from_notification(
+                row
+            )
+        )
+
+        self.assertEqual(
+            listing.id,
+            "123456",
+        )
+        self.assertEqual(
+            listing.price,
+            "£35.00",
+        )
+        self.assertEqual(
+            listing.brand,
+            "RST",
+        )
+
+    def test_successful_notification_is_marked_sent(self) -> None:
+        class FakeDatabase:
+            def __init__(self) -> None:
+                self.sent: list[int] = []
+                self.failed: list[int] = []
+
+            def pending_notifications(
+                self,
+                limit: int,
+            ) -> list[dict]:
+                return [
+                    {
+                        "id": 7,
+                        "listing_id": "123456",
+                        "notification_type": "new_listing",
+                        "old_price": None,
+                        "payload_json": json.dumps(
+                            make_listing().to_dict()
+                        ),
+                        "attempts": 1,
+                    }
+                ]
+
+            def mark_notification_sent(
+                self,
+                notification_id: int,
+            ) -> None:
+                self.sent.append(
+                    notification_id
+                )
+
+            def mark_notification_failed(
+                self,
+                notification_id: int,
+                error: str,
+            ) -> None:
+                self.failed.append(
+                    notification_id
+                )
+
+        class FakeTelegram:
+            def send_listing(
+                self,
+                listing: Listing,
+            ) -> bool:
+                return True
+
+            def send_price_drop(
+                self,
+                listing: Listing,
+                old_price: float,
+            ) -> bool:
+                return True
+
+        agent = VintedAgent.__new__(
+            VintedAgent
+        )
+        agent.database = FakeDatabase()
+        agent.telegram = FakeTelegram()
+
+        stats = CycleStats()
+
+        agent._process_notification_queue(
+            stats
+        )
+
+        self.assertEqual(
+            agent.database.sent,
+            [7],
+        )
+        self.assertEqual(
+            agent.database.failed,
+            [],
+        )
+        self.assertEqual(
+            stats.notifications_sent,
+            1,
+        )
+        self.assertEqual(
+            stats.notification_failures,
+            0,
+        )
+
+    def test_failed_notification_remains_retryable(self) -> None:
+        class FakeDatabase:
+            def __init__(self) -> None:
+                self.sent: list[int] = []
+                self.failed: list[int] = []
+
+            def pending_notifications(
+                self,
+                limit: int,
+            ) -> list[dict]:
+                return [
+                    {
+                        "id": 8,
+                        "listing_id": "123456",
+                        "notification_type": "price_drop",
+                        "old_price": 50.0,
+                        "payload_json": json.dumps(
+                            make_listing(
+                                price="£40.00"
+                            ).to_dict()
+                        ),
+                        "attempts": 2,
+                    }
+                ]
+
+            def mark_notification_sent(
+                self,
+                notification_id: int,
+            ) -> None:
+                self.sent.append(
+                    notification_id
+                )
+
+            def mark_notification_failed(
+                self,
+                notification_id: int,
+                error: str,
+            ) -> None:
+                self.failed.append(
+                    notification_id
+                )
+
+        class FakeTelegram:
+            def send_listing(
+                self,
+                listing: Listing,
+            ) -> bool:
+                return False
+
+            def send_price_drop(
+                self,
+                listing: Listing,
+                old_price: float,
+            ) -> bool:
+                return False
+
+        agent = VintedAgent.__new__(
+            VintedAgent
+        )
+        agent.database = FakeDatabase()
+        agent.telegram = FakeTelegram()
+
+        stats = CycleStats()
+
+        agent._process_notification_queue(
+            stats
+        )
+
+        self.assertEqual(
+            agent.database.sent,
+            [],
+        )
+        self.assertEqual(
+            agent.database.failed,
+            [8],
+        )
+        self.assertEqual(
+            stats.notifications_sent,
+            0,
+        )
+        self.assertEqual(
+            stats.notification_failures,
+            1,
         )
 
 
