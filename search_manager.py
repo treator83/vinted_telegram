@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any, Final
 
+from runtime_state import is_paused
 from search import Search
 
 LOGGER = logging.getLogger(__name__)
@@ -29,6 +30,12 @@ class SearchManager:
 
     def load(self) -> list[Search]:
         """Load, validate, and return configured searches."""
+
+        if is_paused():
+            LOGGER.info(
+                "Catalogue monitoring is paused; no searches will run"
+            )
+            return []
 
         data = self._read_file()
 
