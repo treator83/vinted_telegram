@@ -1044,15 +1044,25 @@ class VintedAgent:
         ):
             pictures = []
 
+        try:
+            queued_listing_id = row[
+                "listing_id"
+            ]  # type: ignore[index]
+        except (
+            KeyError,
+            TypeError,
+            IndexError,
+        ):
+            queued_listing_id = ""
+
         return Listing(
             id=str(
-                value(
+                payload.get(
                     "id",
-                    value(
-                        "listing_id",
-                        "",
-                    ),
+                    queued_listing_id,
                 )
+                or queued_listing_id
+                or ""
             ),
             title=str(
                 value(
