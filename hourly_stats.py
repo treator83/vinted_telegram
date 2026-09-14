@@ -182,7 +182,8 @@ def get_statistics() -> dict:
                             posted_at,
                             first_seen
                         )
-                    )                ) AS value
+                    )
+                ) AS value
 
             FROM listings
 
