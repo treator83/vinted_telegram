@@ -444,7 +444,7 @@ def build_message(
                     f"{rate:.1f}%"
                 ),
                 (
-                    f"  Avg sold: "
+                    f"  Avg asking: "
                     f"{price_text}"
                 ),
             ]
