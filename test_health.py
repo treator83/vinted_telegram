@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import signal
 import unittest
+from unittest.mock import patch
 
 import health_monitor
 
@@ -162,6 +164,28 @@ class HealthMonitorTests(unittest.TestCase):
                 issues,
                 "inactive",
             )
+        )
+
+    def test_restart_agent_signals_main_pid_and_observes_replacement(self) -> None:
+        with (
+            patch.object(
+                health_monitor,
+                "_service_main_pid",
+                side_effect=[1234, 5678],
+            ),
+            patch.object(
+                health_monitor.os,
+                "kill",
+            ) as kill,
+        ):
+            restarted = health_monitor._restart_agent_process(
+                grace_seconds=1
+            )
+
+        self.assertTrue(restarted)
+        kill.assert_called_once_with(
+            1234,
+            signal.SIGTERM,
         )
 
     def test_health_message_contains_operational_metrics(self) -> None:
