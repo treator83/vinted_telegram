@@ -1,0 +1,13 @@
+[Unit]
+Description=Check and self-heal Vinted Agent health
+After=network-online.target vinted-agent.service vinted-commands.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=awex
+Group=awex
+WorkingDirectory=/opt/vinted-agent
+Environment=HOME=/home/awex
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/vinted-agent/.venv/bin/python /opt/vinted-agent/health_monitor.py
