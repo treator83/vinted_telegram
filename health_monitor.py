@@ -1,12 +1,15 @@
-"""Proactive health monitoring and Telegram alerts for Vinted Agent."""
+"""Proactive health monitoring and self-healing for Vinted Agent."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import signal
 import sqlite3
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final
@@ -27,7 +30,15 @@ MEMORY_WARNING_BYTES: Final[int] = 2560 * 1024 * 1024
 DISK_WARNING_BYTES: Final[int] = 2 * 1024 * 1024 * 1024
 DISK_WARNING_PERCENT: Final[float] = 10.0
 TELEGRAM_TIMEOUT: Final[tuple[int, int]] = (5, 10)
+SELF_HEAL_GRACE_SECONDS: Final[int] = 15
+SELF_HEAL_ISSUE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "database_stale",
+        "chromium",
+    }
+)
 ALERT_STATE_FILE: Final[Path] = DATA_DIR / "health-alert-state.json"
+SELF_HEAL_STATE_FILE: Final[Path] = DATA_DIR / "health-self-heal-state.json"
 
 
 def _utc_now() -> datetime:
@@ -75,8 +86,26 @@ def _service_state(unit: str) -> str:
     return _run_systemctl("is-active", unit) or "unknown"
 
 
+def _service_property(unit: str, name: str) -> str:
+    return _run_systemctl(
+        "show",
+        unit,
+        f"--property={name}",
+        "--value",
+    )
+
+
+def _service_main_pid(unit: str) -> int | None:
+    value = _service_property(unit, "MainPID")
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 1 else None
+
+
 def _service_memory_bytes(unit: str) -> int | None:
-    value = _run_systemctl("show", unit, "--property=MemoryCurrent", "--value")
+    value = _service_property(unit, "MemoryCurrent")
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -84,11 +113,9 @@ def _service_memory_bytes(unit: str) -> int | None:
 
 
 def _service_uptime_seconds(unit: str) -> float | None:
-    active_value = _run_systemctl(
-        "show",
+    active_value = _service_property(
         unit,
-        "--property=ActiveEnterTimestampMonotonic",
-        "--value",
+        "ActiveEnterTimestampMonotonic",
     )
 
     try:
@@ -104,16 +131,15 @@ def _service_uptime_seconds(unit: str) -> float | None:
 
 
 def _browser_process_count(unit: str) -> int | None:
-    control_group = _run_systemctl(
-        "show",
-        unit,
-        "--property=ControlGroup",
-        "--value",
-    )
+    control_group = _service_property(unit, "ControlGroup")
     if not control_group:
         return None
 
-    process_file = Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+    process_file = (
+        Path("/sys/fs/cgroup")
+        / control_group.lstrip("/")
+        / "cgroup.procs"
+    )
 
     try:
         process_ids = process_file.read_text(encoding="utf-8").split()
@@ -125,11 +151,18 @@ def _browser_process_count(unit: str) -> int | None:
         try:
             command = (
                 Path("/proc") / process_id / "cmdline"
-            ).read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore").casefold()
+            ).read_bytes().replace(b"\x00", b" ").decode(
+                "utf-8",
+                errors="ignore",
+            ).casefold()
         except OSError:
             continue
 
-        if "chromedriver" in command or "google-chrome" in command or "chromium" in command:
+        if (
+            "chromedriver" in command
+            or "google-chrome" in command
+            or "chromium" in command
+        ):
             count += 1
 
     return count
@@ -147,7 +180,10 @@ def _database_snapshot(now: datetime) -> dict[str, Any]:
     }
 
     try:
-        connection = sqlite3.connect(str(DATABASE_PATH), timeout=10)
+        connection = sqlite3.connect(
+            str(DATABASE_PATH),
+            timeout=10,
+        )
         connection.row_factory = sqlite3.Row
 
         try:
@@ -175,7 +211,8 @@ def _database_snapshot(now: datetime) -> dict[str, Any]:
                     SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failed,
                     MIN(
                         CASE
-                            WHEN state IN ('pending', 'failed') THEN created_at
+                            WHEN state IN ('pending', 'failed')
+                            THEN created_at
                         END
                     ) AS oldest
                 FROM notification_queue
@@ -195,11 +232,21 @@ def _database_snapshot(now: datetime) -> dict[str, Any]:
         {
             "ok": True,
             "listings": int(total["count"] or 0) if total else 0,
-            "pending_notifications": int(queue["pending"] or 0) if queue else 0,
-            "failed_notifications": int(queue["failed"] or 0) if queue else 0,
+            "pending_notifications": (
+                int(queue["pending"] or 0) if queue else 0
+            ),
+            "failed_notifications": (
+                int(queue["failed"] or 0) if queue else 0
+            ),
             "latest_activity": latest_value,
-            "latest_activity_age_minutes": _age_minutes(latest_value, now),
-            "oldest_queue_age_minutes": _age_minutes(oldest_value, now),
+            "latest_activity_age_minutes": _age_minutes(
+                latest_value,
+                now,
+            ),
+            "oldest_queue_age_minutes": _age_minutes(
+                oldest_value,
+                now,
+            ),
         }
     )
     return result
@@ -211,7 +258,12 @@ def _disk_snapshot() -> dict[str, Any]:
     except OSError:
         return {"ok": False}
 
-    free_percent = usage.free / usage.total * 100.0 if usage.total else 0.0
+    free_percent = (
+        usage.free / usage.total * 100.0
+        if usage.total
+        else 0.0
+    )
+
     return {
         "ok": True,
         "total_bytes": usage.total,
@@ -238,7 +290,10 @@ def _telegram_snapshot() -> dict[str, Any]:
             timeout=TELEGRAM_TIMEOUT,
         )
         identity_payload = identity.json()
-        result["api_ok"] = bool(identity.ok and identity_payload.get("ok") is True)
+        result["api_ok"] = bool(
+            identity.ok
+            and identity_payload.get("ok") is True
+        )
 
         webhook = requests.get(
             f"{api}/getWebhookInfo",
@@ -247,7 +302,9 @@ def _telegram_snapshot() -> dict[str, Any]:
         webhook_payload = webhook.json()
         if webhook.ok and webhook_payload.get("ok") is True:
             webhook_result = webhook_payload.get("result") or {}
-            result["webhook_url"] = str(webhook_result.get("url") or "")
+            result["webhook_url"] = str(
+                webhook_result.get("url") or ""
+            )
     except (requests.RequestException, ValueError):
         LOGGER.warning("Telegram health request failed")
 
@@ -290,14 +347,29 @@ def evaluate_issues(snapshot: dict[str, Any]) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
 
     if snapshot.get("agent_service") != "active":
-        issues.append({"code": "agent_service", "message": "vinted-agent service is not active"})
+        issues.append(
+            {
+                "code": "agent_service",
+                "message": "vinted-agent service is not active",
+            }
+        )
 
     if snapshot.get("commands_service") != "active":
-        issues.append({"code": "commands_service", "message": "vinted-commands service is not active"})
+        issues.append(
+            {
+                "code": "commands_service",
+                "message": "vinted-commands service is not active",
+            }
+        )
 
     database = snapshot.get("database") or {}
     if not database.get("ok"):
-        issues.append({"code": "database", "message": "database health check failed"})
+        issues.append(
+            {
+                "code": "database",
+                "message": "database health check failed",
+            }
+        )
     else:
         age = database.get("latest_activity_age_minutes")
         if (
@@ -308,7 +380,9 @@ def evaluate_issues(snapshot: dict[str, Any]) -> list[dict[str, str]]:
             issues.append(
                 {
                     "code": "database_stale",
-                    "message": f"database activity is {float(age):.0f} minutes old",
+                    "message": (
+                        f"database activity is {float(age):.0f} minutes old"
+                    ),
                 }
             )
 
@@ -317,79 +391,165 @@ def evaluate_issues(snapshot: dict[str, Any]) -> list[dict[str, str]]:
             issues.append(
                 {
                     "code": "telegram_queue_failed",
-                    "message": f"{failed} Telegram notification(s) are failed",
+                    "message": (
+                        f"{failed} Telegram notification(s) are failed"
+                    ),
                 }
             )
 
         queue_age = database.get("oldest_queue_age_minutes")
-        if queue_age is not None and float(queue_age) > QUEUE_STALE_MINUTES:
+        if (
+            queue_age is not None
+            and float(queue_age) > QUEUE_STALE_MINUTES
+        ):
             issues.append(
                 {
                     "code": "telegram_queue_stale",
-                    "message": f"oldest queued Telegram alert is {float(queue_age):.0f} minutes old",
+                    "message": (
+                        "oldest queued Telegram alert is "
+                        f"{float(queue_age):.0f} minutes old"
+                    ),
                 }
             )
 
     if snapshot.get("agent_service") == "active":
         browser_processes = snapshot.get("browser_processes")
         if browser_processes == 0:
-            issues.append({"code": "chromium", "message": "Chromium is not detected in the agent service"})
+            issues.append(
+                {
+                    "code": "chromium",
+                    "message": (
+                        "Chromium is not detected in the agent service"
+                    ),
+                }
+            )
 
     memory_bytes = snapshot.get("agent_memory_bytes")
-    if memory_bytes is not None and int(memory_bytes) > MEMORY_WARNING_BYTES:
+    if (
+        memory_bytes is not None
+        and int(memory_bytes) > MEMORY_WARNING_BYTES
+    ):
         issues.append(
             {
                 "code": "memory",
-                "message": f"agent memory is {int(memory_bytes) / 1024**3:.1f} GiB",
+                "message": (
+                    f"agent memory is {int(memory_bytes) / 1024**3:.1f} GiB"
+                ),
             }
         )
 
     disk = snapshot.get("disk") or {}
     if not disk.get("ok"):
-        issues.append({"code": "disk", "message": "disk usage check failed"})
+        issues.append(
+            {
+                "code": "disk",
+                "message": "disk usage check failed",
+            }
+        )
     else:
         free_bytes = int(disk.get("free_bytes") or 0)
         free_percent = float(disk.get("free_percent") or 0.0)
-        if free_bytes < DISK_WARNING_BYTES or free_percent < DISK_WARNING_PERCENT:
+        if (
+            free_bytes < DISK_WARNING_BYTES
+            or free_percent < DISK_WARNING_PERCENT
+        ):
             issues.append(
                 {
                     "code": "disk_low",
-                    "message": f"disk free space is {free_bytes / 1024**3:.1f} GiB ({free_percent:.1f}%)",
+                    "message": (
+                        "disk free space is "
+                        f"{free_bytes / 1024**3:.1f} GiB "
+                        f"({free_percent:.1f}%)"
+                    ),
                 }
             )
 
     telegram = snapshot.get("telegram") or {}
     if not telegram.get("api_ok"):
-        issues.append({"code": "telegram_api", "message": "Telegram Bot API check failed"})
+        issues.append(
+            {
+                "code": "telegram_api",
+                "message": "Telegram Bot API check failed",
+            }
+        )
 
     webhook_url = str(telegram.get("webhook_url") or "").strip()
     if webhook_url:
-        issues.append({"code": "telegram_webhook", "message": "Telegram webhook is configured; polling commands will conflict"})
+        issues.append(
+            {
+                "code": "telegram_webhook",
+                "message": (
+                    "Telegram webhook is configured; "
+                    "polling commands will conflict"
+                ),
+            }
+        )
 
     return issues
 
 
 def _issue_codes(issues: list[dict[str, str]]) -> list[str]:
-    return sorted(str(issue.get("code") or "") for issue in issues if issue.get("code"))
+    return sorted(
+        str(issue.get("code") or "")
+        for issue in issues
+        if issue.get("code")
+    )
 
 
-def _load_alert_state() -> dict[str, Any]:
+def _self_heal_issue_codes(
+    issues: list[dict[str, str]],
+) -> list[str]:
+    return sorted(
+        code
+        for code in _issue_codes(issues)
+        if code in SELF_HEAL_ISSUE_CODES
+    )
+
+
+def _load_json_state(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(ALERT_STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _save_alert_state(codes: list[str]) -> None:
+def _save_json_state(path: Path, payload: dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "notified_issue_codes": sorted(codes),
-        "updated_at": _utc_now().strftime("%Y-%m-%d %H:%M:%S UTC"),
-    }
-    temporary = ALERT_STATE_FILE.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    temporary.replace(ALERT_STATE_FILE)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _load_alert_state() -> dict[str, Any]:
+    return _load_json_state(ALERT_STATE_FILE)
+
+
+def _save_alert_state(codes: list[str]) -> None:
+    _save_json_state(
+        ALERT_STATE_FILE,
+        {
+            "notified_issue_codes": sorted(codes),
+            "updated_at": _utc_now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        },
+    )
+
+
+def _load_self_heal_state() -> dict[str, Any]:
+    return _load_json_state(SELF_HEAL_STATE_FILE)
+
+
+def _save_self_heal_state(codes: list[str]) -> None:
+    _save_json_state(
+        SELF_HEAL_STATE_FILE,
+        {
+            "handled_issue_codes": sorted(codes),
+            "updated_at": _utc_now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        },
+    )
 
 
 def notification_action(
@@ -410,13 +570,84 @@ def notification_action(
     return None
 
 
+def self_heal_action(
+    previous_codes: list[str],
+    current_issues: list[dict[str, str]],
+    agent_state: str,
+) -> bool:
+    """Return True when this health episode warrants one agent restart."""
+
+    if agent_state != "active":
+        return False
+
+    current = set(_self_heal_issue_codes(current_issues))
+    previous = set(previous_codes)
+
+    if not current:
+        return False
+
+    return not current.issubset(previous)
+
+
+def _restart_agent_process(
+    grace_seconds: int = SELF_HEAL_GRACE_SECONDS,
+) -> bool:
+    """Signal the agent process so systemd Restart=always can recover it."""
+
+    pid = _service_main_pid(AGENT_SERVICE)
+    if pid is None:
+        LOGGER.error("Automatic recovery could not find agent MainPID")
+        return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        LOGGER.error("Automatic recovery could not signal agent: %s", exc)
+        return False
+
+    LOGGER.warning(
+        "Automatic recovery sent SIGTERM to vinted-agent MainPID %d",
+        pid,
+    )
+
+    deadline = time.monotonic() + max(0, grace_seconds)
+    while time.monotonic() < deadline:
+        current_pid = _service_main_pid(AGENT_SERVICE)
+        if current_pid != pid:
+            return True
+        time.sleep(1)
+
+    current_pid = _service_main_pid(AGENT_SERVICE)
+    if current_pid != pid:
+        return True
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError) as exc:
+        LOGGER.error(
+            "Automatic recovery could not force-stop agent: %s",
+            exc,
+        )
+        return False
+
+    LOGGER.error(
+        "Automatic recovery escalated to SIGKILL for vinted-agent MainPID %d",
+        pid,
+    )
+    return True
+
+
 def _format_duration(seconds: object) -> str:
     if seconds is None:
         return "n/a"
+
     total = max(0, int(float(seconds)))
     days, remainder = divmod(total, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
+
     if days:
         return f"{days}d {hours}h {minutes}m"
     if hours:
@@ -424,7 +655,11 @@ def _format_duration(seconds: object) -> str:
     return f"{minutes}m"
 
 
-def build_health_message(snapshot: dict[str, Any], *, alert: bool = False) -> str:
+def build_health_message(
+    snapshot: dict[str, Any],
+    *,
+    alert: bool = False,
+) -> str:
     """Build a compact Telegram health summary."""
 
     issues = snapshot.get("issues") or []
@@ -434,7 +669,18 @@ def build_health_message(snapshot: dict[str, Any], *, alert: bool = False) -> st
 
     if alert and issues:
         lines = ["🚨 VINTED AGENT HEALTH ALERT", ""]
-        lines.extend(f"• {issue['message']}" for issue in issues)
+        lines.extend(
+            f"• {issue['message']}"
+            for issue in issues
+        )
+
+        if snapshot.get("auto_restart_planned"):
+            lines.extend(
+                [
+                    "",
+                    "♻️ Automatic recovery: restarting vinted-agent",
+                ]
+            )
     elif alert:
         lines = ["✅ VINTED AGENT RECOVERED"]
     else:
@@ -446,15 +692,29 @@ def build_health_message(snapshot: dict[str, Any], *, alert: bool = False) -> st
             "",
             f"Agent: {snapshot.get('agent_service', 'unknown')}",
             f"Commands: {snapshot.get('commands_service', 'unknown')}",
-            f"Monitoring: {'paused' if snapshot.get('monitoring_paused') else 'running'}",
+            (
+                "Monitoring: paused"
+                if snapshot.get("monitoring_paused")
+                else "Monitoring: running"
+            ),
             f"Uptime: {_format_duration(snapshot.get('agent_uptime_seconds'))}",
             (
                 "Memory: n/a"
                 if snapshot.get("agent_memory_bytes") is None
-                else f"Memory: {int(snapshot['agent_memory_bytes']) / 1024**2:.0f} MiB"
+                else (
+                    "Memory: "
+                    f"{int(snapshot['agent_memory_bytes']) / 1024**2:.0f} MiB"
+                )
             ),
-            f"Chromium processes: {snapshot.get('browser_processes', 'n/a')}",
-            f"Database: {'OK' if database.get('ok') else 'ERROR'} ({int(database.get('listings') or 0)} listings)",
+            (
+                "Chromium processes: "
+                f"{snapshot.get('browser_processes', 'n/a')}"
+            ),
+            (
+                "Database: "
+                f"{'OK' if database.get('ok') else 'ERROR'} "
+                f"({int(database.get('listings') or 0)} listings)"
+            ),
             (
                 "Queue: "
                 f"{int(database.get('pending_notifications') or 0)} pending / "
@@ -463,10 +723,22 @@ def build_health_message(snapshot: dict[str, Any], *, alert: bool = False) -> st
             (
                 "Disk free: n/a"
                 if not disk.get("ok")
-                else f"Disk free: {int(disk.get('free_bytes') or 0) / 1024**3:.1f} GiB ({float(disk.get('free_percent') or 0):.1f}%)"
+                else (
+                    "Disk free: "
+                    f"{int(disk.get('free_bytes') or 0) / 1024**3:.1f} GiB "
+                    f"({float(disk.get('free_percent') or 0):.1f}%)"
+                )
             ),
-            f"Telegram API: {'OK' if telegram.get('api_ok') else 'ERROR'}",
-            f"Webhook: {'none' if not telegram.get('webhook_url') else 'CONFIGURED'}",
+            (
+                "Telegram API: OK"
+                if telegram.get("api_ok")
+                else "Telegram API: ERROR"
+            ),
+            (
+                "Webhook: none"
+                if not telegram.get("webhook_url")
+                else "Webhook: CONFIGURED"
+            ),
         ]
     )
 
@@ -501,34 +773,75 @@ def _send_telegram(message: str) -> bool:
 
 
 def run_health_check() -> dict[str, Any]:
-    """Collect health, persist it, and alert only on health-state changes."""
+    """Collect health, alert on changes, and self-heal a stalled agent once."""
 
     snapshot = collect_health()
-    write_health(snapshot)
 
-    previous = _load_alert_state()
-    previous_codes = previous.get("notified_issue_codes") or []
-    if not isinstance(previous_codes, list):
-        previous_codes = []
+    alert_state = _load_alert_state()
+    previous_alert_codes = (
+        alert_state.get("notified_issue_codes") or []
+    )
+    if not isinstance(previous_alert_codes, list):
+        previous_alert_codes = []
 
-    action = notification_action(previous_codes, snapshot["issues"])
+    self_heal_state = _load_self_heal_state()
+    previous_heal_codes = (
+        self_heal_state.get("handled_issue_codes") or []
+    )
+    if not isinstance(previous_heal_codes, list):
+        previous_heal_codes = []
+
+    current_heal_codes = _self_heal_issue_codes(
+        snapshot["issues"]
+    )
+    should_restart = self_heal_action(
+        previous_heal_codes,
+        snapshot["issues"],
+        str(snapshot.get("agent_service") or ""),
+    )
+    snapshot["auto_restart_planned"] = should_restart
+
+    action = notification_action(
+        previous_alert_codes,
+        snapshot["issues"],
+    )
 
     if action == "alert":
-        sent = _send_telegram(build_health_message(snapshot, alert=True))
+        sent = _send_telegram(
+            build_health_message(snapshot, alert=True)
+        )
         if sent:
             _save_alert_state(_issue_codes(snapshot["issues"]))
     elif action == "recovery":
-        sent = _send_telegram(build_health_message(snapshot, alert=True))
+        sent = _send_telegram(
+            build_health_message(snapshot, alert=True)
+        )
         if sent:
             _save_alert_state([])
-    elif not ALERT_STATE_FILE.exists() and not snapshot["issues"]:
+    elif (
+        not ALERT_STATE_FILE.exists()
+        and not snapshot["issues"]
+    ):
         _save_alert_state([])
 
+    if should_restart:
+        restarted = _restart_agent_process()
+        snapshot["auto_restart_requested"] = restarted
+        if restarted:
+            _save_self_heal_state(current_heal_codes)
+    elif not current_heal_codes and previous_heal_codes:
+        _save_self_heal_state([])
+
+    write_health(snapshot)
+
     LOGGER.info(
-        "Health check: %s (%d issue%s)",
+        "Health check: %s (%d issue%s)%s",
         snapshot["status"],
         len(snapshot["issues"]),
         "" if len(snapshot["issues"]) == 1 else "s",
+        " | automatic restart requested"
+        if snapshot.get("auto_restart_requested")
+        else "",
     )
 
     return snapshot
