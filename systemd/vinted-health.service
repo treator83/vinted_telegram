@@ -1,5 +1,5 @@
 [Unit]
-Description=Check Vinted Agent health
+Description=Check and self-heal Vinted Agent health
 After=network-online.target vinted-agent.service vinted-commands.service
 Wants=network-online.target
 
