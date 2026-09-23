@@ -39,7 +39,9 @@ class HealthMonitorTests(unittest.TestCase):
         }
 
     def test_healthy_snapshot_has_no_issues(self) -> None:
-        issues = health_monitor.evaluate_issues(self._healthy_snapshot())
+        issues = health_monitor.evaluate_issues(
+            self._healthy_snapshot()
+        )
         self.assertEqual(issues, [])
 
     def test_detects_service_queue_browser_and_webhook_failures(self) -> None:
@@ -47,11 +49,15 @@ class HealthMonitorTests(unittest.TestCase):
         snapshot["commands_service"] = "inactive"
         snapshot["browser_processes"] = 0
         snapshot["database"]["failed_notifications"] = 2
-        snapshot["telegram"]["webhook_url"] = "https://example.com/webhook"
+        snapshot["telegram"]["webhook_url"] = (
+            "https://example.com/webhook"
+        )
 
         codes = {
             issue["code"]
-            for issue in health_monitor.evaluate_issues(snapshot)
+            for issue in health_monitor.evaluate_issues(
+                snapshot
+            )
         }
 
         self.assertTrue(
@@ -70,31 +76,101 @@ class HealthMonitorTests(unittest.TestCase):
 
         codes = {
             issue["code"]
-            for issue in health_monitor.evaluate_issues(snapshot)
+            for issue in health_monitor.evaluate_issues(
+                snapshot
+            )
         }
 
         self.assertNotIn("database_stale", codes)
 
     def test_notification_action_alerts_once_and_recovers(self) -> None:
-        issue = [{"code": "database", "message": "database failed"}]
+        issue = [
+            {
+                "code": "database",
+                "message": "database failed",
+            }
+        ]
 
         self.assertEqual(
             health_monitor.notification_action([], issue),
             "alert",
         )
         self.assertIsNone(
-            health_monitor.notification_action(["database"], issue)
+            health_monitor.notification_action(
+                ["database"],
+                issue,
+            )
         )
         self.assertEqual(
-            health_monitor.notification_action(["database"], []),
+            health_monitor.notification_action(
+                ["database"],
+                [],
+            ),
             "recovery",
+        )
+
+    def test_self_heal_restarts_once_for_stalled_database(self) -> None:
+        issues = [
+            {
+                "code": "database_stale",
+                "message": "database activity is 23 minutes old",
+            }
+        ]
+
+        self.assertTrue(
+            health_monitor.self_heal_action(
+                [],
+                issues,
+                "active",
+            )
+        )
+        self.assertFalse(
+            health_monitor.self_heal_action(
+                ["database_stale"],
+                issues,
+                "active",
+            )
+        )
+
+    def test_self_heal_ignores_queue_only_problem(self) -> None:
+        issues = [
+            {
+                "code": "telegram_queue_stale",
+                "message": "oldest queued Telegram alert is 23 minutes old",
+            }
+        ]
+
+        self.assertFalse(
+            health_monitor.self_heal_action(
+                [],
+                issues,
+                "active",
+            )
+        )
+
+    def test_self_heal_does_not_signal_inactive_agent(self) -> None:
+        issues = [
+            {
+                "code": "chromium",
+                "message": "Chromium is not detected in the agent service",
+            }
+        ]
+
+        self.assertFalse(
+            health_monitor.self_heal_action(
+                [],
+                issues,
+                "inactive",
+            )
         )
 
     def test_health_message_contains_operational_metrics(self) -> None:
         snapshot = self._healthy_snapshot()
         snapshot["issues"] = []
 
-        message = health_monitor.build_health_message(snapshot)
+        message = health_monitor.build_health_message(
+            snapshot
+        )
 
         for text in (
             "VINTED AGENT HEALTH",
@@ -108,6 +184,26 @@ class HealthMonitorTests(unittest.TestCase):
             "Webhook: none",
         ):
             self.assertIn(text, message)
+
+    def test_alert_message_mentions_automatic_recovery(self) -> None:
+        snapshot = self._healthy_snapshot()
+        snapshot["issues"] = [
+            {
+                "code": "database_stale",
+                "message": "database activity is 23 minutes old",
+            }
+        ]
+        snapshot["auto_restart_planned"] = True
+
+        message = health_monitor.build_health_message(
+            snapshot,
+            alert=True,
+        )
+
+        self.assertIn(
+            "Automatic recovery: restarting vinted-agent",
+            message,
+        )
 
 
 if __name__ == "__main__":
