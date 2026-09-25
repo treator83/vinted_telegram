@@ -30,6 +30,7 @@ MEMORY_WARNING_BYTES: Final[int] = 2560 * 1024 * 1024
 DISK_WARNING_BYTES: Final[int] = 2 * 1024 * 1024 * 1024
 DISK_WARNING_PERCENT: Final[float] = 10.0
 TELEGRAM_TIMEOUT: Final[tuple[int, int]] = (5, 10)
+BROWSER_CONFIRM_DELAY_SECONDS: Final[int] = 15
 SELF_HEAL_GRACE_SECONDS: Final[int] = 15
 SELF_HEAL_ISSUE_CODES: Final[frozenset[str]] = frozenset(
     {
@@ -131,6 +132,8 @@ def _service_uptime_seconds(unit: str) -> float | None:
 
 
 def _browser_process_count(unit: str) -> int | None:
+    """Count Selenium/Chrome processes inside the agent's systemd cgroup."""
+
     control_group = _service_property(unit, "ControlGroup")
     if not control_group:
         return None
@@ -158,10 +161,30 @@ def _browser_process_count(unit: str) -> int | None:
         except OSError:
             continue
 
+        try:
+            process_name = (
+                Path("/proc") / process_id / "comm"
+            ).read_text(encoding="utf-8").strip().casefold()
+        except OSError:
+            process_name = ""
+
+        if process_name in {
+            "chrome",
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+        }:
+            count += 1
+            continue
+
+        # Fallback for systems where /proc/<pid>/comm uses an unexpected name.
+        # Deliberately do not count chromedriver or crashpad as a live browser.
         if (
-            "chromedriver" in command
-            or "google-chrome" in command
-            or "chromium" in command
+            "/usr/bin/google-chrome " in command
+            or "/opt/google/chrome/chrome " in command
+            or "/usr/bin/chromium " in command
+            or "/usr/bin/chromium-browser " in command
         ):
             count += 1
 
@@ -311,6 +334,12 @@ def _telegram_snapshot() -> dict[str, Any]:
     return result
 
 
+def _refresh_health_status(snapshot: dict[str, Any]) -> None:
+    issues = evaluate_issues(snapshot)
+    snapshot["issues"] = issues
+    snapshot["status"] = "healthy" if not issues else "unhealthy"
+
+
 def collect_health(now: datetime | None = None) -> dict[str, Any]:
     """Collect one complete health snapshot without changing agent state."""
 
@@ -335,10 +364,63 @@ def collect_health(now: datetime | None = None) -> dict[str, Any]:
         "telegram": _telegram_snapshot(),
     }
 
-    issues = evaluate_issues(snapshot)
-    snapshot["issues"] = issues
-    snapshot["status"] = "healthy" if not issues else "unhealthy"
+    _refresh_health_status(snapshot)
     return snapshot
+
+
+def _confirm_browser_missing(
+    snapshot: dict[str, Any],
+    delay_seconds: int = BROWSER_CONFIRM_DELAY_SECONDS,
+) -> None:
+    """Recheck a missing browser before alerts or automatic recovery.
+
+    Selenium may briefly replace Chrome while recovering a dead session. A
+    single process snapshot can therefore report zero browser processes even
+    though the browser is about to return. Only a second zero reading after a
+    short delay is treated as a confirmed browser failure.
+    """
+
+    if snapshot.get("agent_service") != "active":
+        return
+    if snapshot.get("browser_processes") != 0:
+        return
+
+    snapshot["browser_recheck_performed"] = True
+    LOGGER.warning(
+        "Browser process count is zero; rechecking in %d seconds before recovery",
+        max(0, delay_seconds),
+    )
+
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
+
+    agent_state = _service_state(AGENT_SERVICE)
+    snapshot["agent_service"] = agent_state
+    snapshot["agent_memory_bytes"] = _service_memory_bytes(AGENT_SERVICE)
+    snapshot["agent_uptime_seconds"] = _service_uptime_seconds(AGENT_SERVICE)
+
+    if agent_state == "active":
+        snapshot["browser_processes"] = _browser_process_count(AGENT_SERVICE)
+    else:
+        snapshot["browser_processes"] = 0
+
+    _refresh_health_status(snapshot)
+
+    browser_processes = snapshot.get("browser_processes")
+    if agent_state == "active" and browser_processes == 0:
+        LOGGER.error(
+            "Browser is still missing after confirmation delay; recovery is allowed"
+        )
+    elif agent_state == "active" and browser_processes is not None:
+        LOGGER.info(
+            "Browser recovered during confirmation delay (%s process%s detected)",
+            browser_processes,
+            "" if browser_processes == 1 else "es",
+        )
+    else:
+        LOGGER.warning(
+            "Browser confirmation could not establish an active browser session"
+        )
 
 
 def evaluate_issues(snapshot: dict[str, Any]) -> list[dict[str, str]]:
@@ -419,7 +501,7 @@ def evaluate_issues(snapshot: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "code": "chromium",
                     "message": (
-                        "Chromium is not detected in the agent service"
+                        "Chrome/Chromium is not detected in the agent service"
                     ),
                 }
             )
@@ -707,7 +789,7 @@ def build_health_message(
                 )
             ),
             (
-                "Chromium processes: "
+                "Chrome processes: "
                 f"{snapshot.get('browser_processes', 'n/a')}"
             ),
             (
@@ -776,6 +858,11 @@ def run_health_check() -> dict[str, Any]:
     """Collect health, alert on changes, and self-heal a stalled agent once."""
 
     snapshot = collect_health()
+
+    # A zero browser count is not trusted immediately. Selenium can replace
+    # Chrome during recovery, creating a short window where the cgroup contains
+    # no browser process. Confirm the failure before alerting or restarting.
+    _confirm_browser_missing(snapshot)
 
     alert_state = _load_alert_state()
     previous_alert_codes = (
