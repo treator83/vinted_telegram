@@ -27,6 +27,10 @@ IMAGE_URL_PATTERN: Final[re.Pattern[str]] = re.compile(
     r'"url":"(https://images1\.vinted\.net/[^"]+)"'
 )
 
+ATTRIBUTE_SCAN_LIMIT: Final[int] = 4_000
+JSON_STRING_SCAN_LIMIT: Final[int] = 250_000
+FOLLOWING_KEY_SCAN_LIMIT: Final[int] = 256
+
 
 class ListingStatus(StrEnum):
     """Known availability states for a Vinted listing."""
@@ -67,7 +71,7 @@ class ListingStatusChecker:
     Inspect Vinted listing pages using Selenium.
 
     A Browser may be supplied so the checker shares the same Chromium
-    session as the catalogue scraper.  This avoids the HTTP blocking and
+    session as the catalogue scraper. This avoids the HTTP blocking and
     ambiguous responses seen with raw requests.
     """
 
@@ -91,24 +95,11 @@ class ListingStatusChecker:
             )
 
         try:
-            self.browser.get(
-                url
-            )
-
+            self.browser.get(url)
             driver = self.browser.driver
-
-            page_source = (
-                driver.page_source
-                or ""
-            )
-
-            current_url = (
-                driver.current_url
-                or url
-            )
-
+            page_source = driver.page_source or ""
+            current_url = driver.current_url or url
             visible_text = self._visible_text()
-
         except (
             BrowserError,
             WebDriverException,
@@ -118,7 +109,6 @@ class ListingStatusChecker:
                 url,
                 exc,
             )
-
             return StatusResult(
                 status=ListingStatus.UNKNOWN,
                 reason="browser_error",
@@ -132,15 +122,11 @@ class ListingStatusChecker:
 
         details = self._extract_details(
             page_source,
-            listing_id=self._listing_id(
-                url
-            ),
+            listing_id=self._listing_id(url),
         )
 
         # Prefer values visible in the rendered DOM when available.
-        details = self._merge_dom_details(
-            details
-        )
+        details = self._merge_dom_details(details)
 
         LOGGER.debug(
             "Listing inspection | status=%s | reason=%s | %s",
@@ -161,9 +147,7 @@ class ListingStatusChecker:
         if self._owns_browser:
             self.browser.stop()
 
-    def __enter__(
-        self,
-    ) -> "ListingStatusChecker":
+    def __enter__(self) -> "ListingStatusChecker":
         return self
 
     def __exit__(
@@ -180,12 +164,7 @@ class ListingStatusChecker:
                 By.TAG_NAME,
                 "body",
             )
-
-            return (
-                body.text
-                or ""
-            ).strip()
-
+            return (body.text or "").strip()
         except WebDriverException:
             return ""
 
@@ -194,46 +173,34 @@ class ListingStatusChecker:
         details: ListingDetails,
     ) -> ListingDetails:
         size = (
-            self._dom_text(
-                '[itemprop="size"]'
-            )
+            self._dom_text('[itemprop="size"]')
             or details.size
         )
 
         condition = (
-            self._dom_text(
-                '[itemprop="status"]'
-            )
+            self._dom_text('[itemprop="status"]')
             or details.condition
         )
 
-        # Prefer the structured Next.js value because the rendered DOM can
-        # append UI text such as "... more" to a collapsed description.
+        # Prefer structured data because the rendered DOM may append UI text
+        # such as "... more" to a collapsed description.
         description = (
             details.description
-            or self._dom_text(
-                '[itemprop="description"]'
-            )
+            or self._dom_text('[itemprop="description"]')
         )
 
         upload_text = (
-            self._dom_text(
-                '[itemprop="upload_date"]'
-            )
+            self._dom_text('[itemprop="upload_date"]')
             or details.upload_text
         )
 
         brand = (
-            self._attribute_container_value(
-                "brand"
-            )
+            self._attribute_container_value("brand")
             or details.brand
         )
 
         posted_at = (
-            self._upload_text_to_timestamp(
-                upload_text
-            )
+            self._upload_text_to_timestamp(upload_text)
             or details.posted_at
         )
 
@@ -241,14 +208,10 @@ class ListingStatusChecker:
             size=self._clean(size),
             condition=self._clean(condition),
             brand=self._clean(brand),
-            description=self._clean(
-                description
-            ),
+            description=self._clean(description),
             pictures=details.pictures,
             posted_at=posted_at,
-            upload_text=self._clean(
-                upload_text
-            ),
+            upload_text=self._clean(upload_text),
         )
 
     def _dom_text(
@@ -256,23 +219,15 @@ class ListingStatusChecker:
         selector: str,
     ) -> str | None:
         try:
-            elements = (
-                self.browser.driver
-                .find_elements(
-                    By.CSS_SELECTOR,
-                    selector,
-                )
+            elements = self.browser.driver.find_elements(
+                By.CSS_SELECTOR,
+                selector,
             )
 
             for element in elements:
-                text = (
-                    element.text
-                    or ""
-                ).strip()
-
+                text = (element.text or "").strip()
                 if text:
                     return text
-
         except WebDriverException:
             return None
 
@@ -282,32 +237,23 @@ class ListingStatusChecker:
         self,
         code: str,
     ) -> str | None:
-        selector = (
-            f'[data-testid="item-attributes-{code}"]'
-        )
+        selector = f'[data-testid="item-attributes-{code}"]'
 
         try:
-            elements = (
-                self.browser.driver
-                .find_elements(
-                    By.CSS_SELECTOR,
-                    selector,
-                )
+            elements = self.browser.driver.find_elements(
+                By.CSS_SELECTOR,
+                selector,
             )
 
             for element in elements:
                 lines = [
                     line.strip()
-                    for line in (
-                        element.text
-                        or ""
-                    ).splitlines()
+                    for line in (element.text or "").splitlines()
                     if line.strip()
                 ]
 
                 if len(lines) >= 2:
                     return lines[-1]
-
         except WebDriverException:
             return None
 
@@ -325,44 +271,22 @@ class ListingStatusChecker:
         Detect listing availability.
 
         NOT_FOUND remains a separate audit reason, while the database/report
-        layer counts it as sold per project rules.
+        layer can still aggregate it with unavailable/sold records.
         """
 
-        content = cls._normalise_html(
-            html
-        ).casefold()
-
-        visible = (
-            visible_text
-            or ""
-        ).casefold()
-
-        current = (
-            current_url
-            or ""
-        ).casefold()
+        content = cls._normalise_html(html).casefold()
+        visible = (visible_text or "").casefold()
+        current = (current_url or "").casefold()
 
         sold_signals = (
-            (
-                "schema.org/outofstock",
-                "schema_out_of_stock",
-            ),
-            (
-                '"is_sold":true',
-                "is_sold",
-            ),
-            (
-                '"can_buy":false',
-                "cannot_buy",
-            ),
+            ("schema.org/outofstock", "schema_out_of_stock"),
+            ('"is_sold":true', "is_sold"),
+            ('"can_buy":false', "cannot_buy"),
         )
 
         for signal, reason in sold_signals:
             if signal in content:
-                return (
-                    ListingStatus.SOLD,
-                    reason,
-                )
+                return ListingStatus.SOLD, reason
 
         not_found_url_signals = (
             "/404",
@@ -398,35 +322,17 @@ class ListingStatusChecker:
             )
 
         active_signals = (
-            (
-                'data-testid="item-buy-button"',
-                "buy_button",
-            ),
-            (
-                "schema.org/instock",
-                "schema_in_stock",
-            ),
-            (
-                '"is_sold":false',
-                "is_sold_false",
-            ),
-            (
-                '"can_buy":true',
-                "can_buy",
-            ),
+            ('data-testid="item-buy-button"', "buy_button"),
+            ("schema.org/instock", "schema_in_stock"),
+            ('"is_sold":false', "is_sold_false"),
+            ('"can_buy":true', "can_buy"),
         )
 
         for signal, reason in active_signals:
             if signal in content:
-                return (
-                    ListingStatus.ACTIVE,
-                    reason,
-                )
+                return ListingStatus.ACTIVE, reason
 
-        return (
-            ListingStatus.UNKNOWN,
-            "no_status_signal",
-        )
+        return ListingStatus.UNKNOWN, "no_status_signal"
 
     @classmethod
     def _extract_details(
@@ -437,29 +343,12 @@ class ListingStatusChecker:
     ) -> ListingDetails:
         """Extract item details from Vinted's rendered HTML/Next.js data."""
 
-        content = cls._normalise_html(
-            html
-        )
+        content = cls._normalise_html(html)
 
-        size = cls._attribute_value(
-            content,
-            "size",
-        )
-
-        condition = cls._attribute_value(
-            content,
-            "status",
-        )
-
-        brand = cls._attribute_value(
-            content,
-            "brand",
-        )
-
-        upload_text = cls._attribute_value(
-            content,
-            "upload_date",
-        )
+        size = cls._attribute_value(content, "size")
+        condition = cls._attribute_value(content, "status")
+        brand = cls._attribute_value(content, "brand")
+        upload_text = cls._attribute_value(content, "upload_date")
 
         description = cls._json_string_value(
             content,
@@ -472,85 +361,153 @@ class ListingStatusChecker:
             listing_id=listing_id,
         )
 
-        posted_at = (
-            cls._upload_text_to_timestamp(
-                upload_text
-            )
-        )
+        posted_at = cls._upload_text_to_timestamp(upload_text)
 
         return ListingDetails(
             size=cls._clean(size),
-            condition=cls._clean(
-                condition
-            ),
+            condition=cls._clean(condition),
             brand=cls._clean(brand),
-            description=cls._clean(
-                description
-            ),
-            pictures=tuple(
-                pictures
-            ),
+            description=cls._clean(description),
+            pictures=tuple(pictures),
             posted_at=posted_at,
-            upload_text=cls._clean(
-                upload_text
-            ),
+            upload_text=cls._clean(upload_text),
         )
 
-    @staticmethod
+    @classmethod
     def _attribute_value(
+        cls,
         content: str,
         code: str,
     ) -> str | None:
-        pattern = re.compile(
-            rf'"code":"{re.escape(code)}",'
-            rf'"data":\{{'
-            rf'.{{0,1000}}?'
-            rf'"value":"((?:\\.|[^"])*)"',
-            re.DOTALL,
-        )
+        """Read one Vinted attribute without backtracking regexes."""
 
-        match = pattern.search(
-            content
-        )
+        code_marker = f'"code":"{code}"'
+        value_marker = '"value":"'
+        search_from = 0
 
-        if match is None:
-            return None
+        while True:
+            code_index = content.find(
+                code_marker,
+                search_from,
+            )
 
-        return ListingStatusChecker._decode_text(
-            match.group(1)
-        )
+            if code_index < 0:
+                return None
 
-    @staticmethod
+            scan_end = min(
+                len(content),
+                code_index + ATTRIBUTE_SCAN_LIMIT,
+            )
+
+            value_index = content.find(
+                value_marker,
+                code_index + len(code_marker),
+                scan_end,
+            )
+
+            if value_index >= 0:
+                start = value_index + len(value_marker)
+                parsed = cls._read_quoted_value(
+                    content,
+                    start,
+                    max_chars=ATTRIBUTE_SCAN_LIMIT,
+                )
+
+                if parsed is not None:
+                    raw_value, _ = parsed
+                    return cls._decode_text(raw_value)
+
+            search_from = code_index + len(code_marker)
+
+    @classmethod
     def _json_string_value(
+        cls,
         content: str,
         key: str,
         *,
         following_key: str | None = None,
     ) -> str | None:
-        if following_key:
-            suffix = (
-                rf'","{re.escape(following_key)}"'
+        """
+        Read a JSON-style string value in linear time.
+
+        The old implementation used a regex with overlapping alternatives
+        (``\\.`` and ``[^\"]``), which can backtrack catastrophically on large
+        escaped Next.js payloads. This scanner advances monotonically and has
+        a hard per-value bound, so a malformed listing cannot pin a CPU core.
+        """
+
+        marker = f'"{key}":"'
+        search_from = 0
+
+        while True:
+            key_index = content.find(
+                marker,
+                search_from,
             )
-        else:
-            suffix = '"'
 
-        pattern = re.compile(
-            rf'"{re.escape(key)}":'
-            rf'"((?:\\.|[^"])*)'
-            rf'{suffix}',
-            re.DOTALL,
-        )
+            if key_index < 0:
+                return None
 
-        match = pattern.search(
-            content
-        )
+            start = key_index + len(marker)
+            parsed = cls._read_quoted_value(
+                content,
+                start,
+                max_chars=JSON_STRING_SCAN_LIMIT,
+            )
 
-        if match is None:
+            if parsed is None:
+                search_from = start
+                continue
+
+            raw_value, end = parsed
+
+            if following_key:
+                expected = f',"{following_key}"'
+                tail_end = min(
+                    len(content),
+                    end + FOLLOWING_KEY_SCAN_LIMIT,
+                )
+                tail = content[end:tail_end].lstrip()
+
+                if not tail.startswith(expected):
+                    search_from = end
+                    continue
+
+            return cls._decode_text(raw_value)
+
+    @staticmethod
+    def _read_quoted_value(
+        content: str,
+        start: int,
+        *,
+        max_chars: int,
+    ) -> tuple[str, int] | None:
+        """Return raw string content and the index after its closing quote."""
+
+        if start < 0 or start >= len(content):
             return None
 
-        return ListingStatusChecker._decode_text(
-            match.group(1)
+        limit = min(
+            len(content),
+            start + max(1, int(max_chars)),
         )
+
+        index = start
+
+        while index < limit:
+            character = content[index]
+
+            # After normalising one outer Next.js escape layer, embedded
+            # quotes may still be preceded by one or more backslashes. Treat
+            # any such quote as data rather than a delimiter. A real field
+            # terminator in Vinted's payload is not backslash-prefixed.
+            if character == '"':
+                if index == start or content[index - 1] != "\\":
+                    return content[start:index], index + 1
+
+            index += 1
+
+        return None
 
     @staticmethod
     def _extract_photo_urls(
@@ -565,29 +522,19 @@ class ListingStatusChecker:
                 f'"item_id":"{listing_id}",'
                 '"photos":['
             )
-
-            start = content.find(
-                marker
-            )
+            start = content.find(marker)
 
             if start >= 0:
-                start += len(
-                    marker
-                )
+                start += len(marker)
 
         if start < 0:
             marker = '"photos":['
-
-            start = content.find(
-                marker
-            )
+            start = content.find(marker)
 
             if start < 0:
                 return []
 
-            start += len(
-                marker
-            )
+            start += len(marker)
 
         end_candidates: list[int] = []
 
@@ -602,39 +549,24 @@ class ListingStatusChecker:
             )
 
             if index >= 0:
-                end_candidates.append(
-                    index
-                )
+                end_candidates.append(index)
 
         if end_candidates:
-            end = min(
-                end_candidates
-            )
+            end = min(end_candidates)
         else:
             end = min(
                 len(content),
                 start + 200_000,
             )
 
-        segment = content[
-            start:end
-        ]
-
+        segment = content[start:end]
         result: list[str] = []
 
-        for match in IMAGE_URL_PATTERN.finditer(
-            segment
-        ):
+        for match in IMAGE_URL_PATTERN.finditer(segment):
             url = (
                 match.group(1)
-                .replace(
-                    "\\u0026",
-                    "&",
-                )
-                .replace(
-                    "\\/",
-                    "/",
-                )
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
             )
 
             # Vinted's full-size gallery images use /f800/.
@@ -642,9 +574,7 @@ class ListingStatusChecker:
                 continue
 
             if url not in result:
-                result.append(
-                    url
-                )
+                result.append(url)
 
         return result
 
@@ -652,40 +582,24 @@ class ListingStatusChecker:
     def _normalise_html(
         value: str,
     ) -> str:
+        """Normalise one escape layer used by Vinted's Next.js payload."""
+
         return (
-            html_lib.unescape(
-                value or ""
-            )
-            .replace(
-                '\\"',
-                '"',
-            )
-            .replace(
-                "\\/",
-                "/",
-            )
+            html_lib.unescape(value or "")
+            .replace('\\"', '"')
+            .replace("\\/", "/")
         )
 
     @staticmethod
     def _decode_text(
         value: str,
     ) -> str:
-        text = (
-            value
-            or ""
-        )
+        text = value or ""
 
         try:
-            decoded = json.loads(
-                f'"{text}"'
-            )
-
-            if isinstance(
-                decoded,
-                str,
-            ):
+            decoded = json.loads(f'"{text}"')
+            if isinstance(decoded, str):
                 text = decoded
-
         except (
             json.JSONDecodeError,
             TypeError,
@@ -695,22 +609,10 @@ class ListingStatusChecker:
         # Next.js payloads are sometimes escaped twice.
         text = (
             text
-            .replace(
-                "\\n",
-                "\n",
-            )
-            .replace(
-                "\\r",
-                "\r",
-            )
-            .replace(
-                "\\t",
-                "\t",
-            )
-            .replace(
-                "\\u0026",
-                "&",
-            )
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace("\\u0026", "&")
         )
 
         unicode_escape = re.compile(
@@ -719,10 +621,7 @@ class ListingStatusChecker:
 
         text = unicode_escape.sub(
             lambda match: chr(
-                int(
-                    match.group(1),
-                    16,
-                )
+                int(match.group(1), 16)
             ),
             text,
         )
@@ -745,30 +644,15 @@ class ListingStatusChecker:
         if not value:
             return None
 
-        text = (
-            str(value)
-            .strip()
-            .casefold()
-        )
+        text = str(value).strip().casefold()
 
-        if text.startswith(
-            "uploaded "
-        ):
-            text = text[
-                len("uploaded "):
-            ].strip()
+        if text.startswith("uploaded "):
+            text = text[len("uploaded "):].strip()
 
-        current = (
-            now
-            or datetime.now(
-                timezone.utc
-            )
-        )
+        current = now or datetime.now(timezone.utc)
 
         if current.tzinfo is None:
-            current = current.replace(
-                tzinfo=timezone.utc
-            )
+            current = current.replace(tzinfo=timezone.utc)
 
         patterns = (
             (
@@ -794,29 +678,15 @@ class ListingStatusChecker:
         )
 
         for pattern, unit in patterns:
-            match = re.match(
-                pattern,
-                text,
-            )
+            match = re.match(pattern, text)
 
             if match is None:
                 continue
 
-            amount = int(
-                match.group(1)
-            )
-
-            delta = timedelta(
-                **{
-                    unit: amount,
-                }
-            )
-
+            amount = int(match.group(1))
+            delta = timedelta(**{unit: amount})
             estimated = (
-                current
-                .astimezone(
-                    timezone.utc
-                )
+                current.astimezone(timezone.utc)
                 - delta
             )
 
@@ -825,35 +695,18 @@ class ListingStatusChecker:
             )
 
         singular_relative = {
-            "a few seconds ago": timedelta(
-                seconds=5
-            ),
-            "a minute ago": timedelta(
-                minutes=1
-            ),
-            "an hour ago": timedelta(
-                hours=1
-            ),
-            "a day ago": timedelta(
-                days=1
-            ),
-            "a week ago": timedelta(
-                weeks=1
-            ),
-            "yesterday": timedelta(
-                days=1
-            ),
+            "a few seconds ago": timedelta(seconds=5),
+            "a minute ago": timedelta(minutes=1),
+            "an hour ago": timedelta(hours=1),
+            "a day ago": timedelta(days=1),
+            "a week ago": timedelta(weeks=1),
+            "yesterday": timedelta(days=1),
         }
 
         if text in singular_relative:
             estimated = (
-                current
-                .astimezone(
-                    timezone.utc
-                )
-                - singular_relative[
-                    text
-                ]
+                current.astimezone(timezone.utc)
+                - singular_relative[text]
             )
 
             return estimated.strftime(
@@ -863,37 +716,25 @@ class ListingStatusChecker:
         # Preserve exact ISO-style timestamps if Vinted supplies one later.
         try:
             parsed = datetime.fromisoformat(
-                text.replace(
-                    "z",
-                    "+00:00",
-                )
+                text.replace("z", "+00:00")
             )
-
         except ValueError:
             return None
 
         if parsed.tzinfo is None:
-            parsed = parsed.replace(
-                tzinfo=timezone.utc
-            )
+            parsed = parsed.replace(tzinfo=timezone.utc)
 
         return (
             parsed
-            .astimezone(
-                timezone.utc
-            )
-            .strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            .astimezone(timezone.utc)
+            .strftime("%Y-%m-%d %H:%M:%S")
         )
 
     @staticmethod
     def _listing_id(
         url: str,
     ) -> str | None:
-        match = ITEM_ID_PATTERN.search(
-            url or ""
-        )
+        match = ITEM_ID_PATTERN.search(url or "")
 
         if match is None:
             return None
@@ -907,8 +748,5 @@ class ListingStatusChecker:
         if value is None:
             return None
 
-        text = str(
-            value
-        ).strip()
-
+        text = str(value).strip()
         return text or None
