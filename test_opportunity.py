@@ -115,7 +115,7 @@ class OpportunityScorerTests(unittest.TestCase):
         self.assertEqual(analysis.comparable_count, 3)
         self.assertTrue(analysis.scope.startswith("brand+size"))
 
-    def test_insufficient_brand_sample_falls_back_to_current_search(self) -> None:
+    def test_insufficient_brand_sample_falls_back_to_search_family(self) -> None:
         for index, price in enumerate((55.0, 60.0), start=1):
             self.add_sold(
                 f"old-brand-{index}",
@@ -149,7 +149,57 @@ class OpportunityScorerTests(unittest.TestCase):
 
         assert analysis is not None
         self.assertEqual(analysis.estimated_resale, 30.0)
-        self.assertEqual(analysis.scope, "search:motorcycle_boots")
+        self.assertEqual(analysis.scope, "family:motorcycle_boots")
+        self.assertEqual(analysis.confidence, "low")
+
+    def test_motorcycle_family_reuses_legacy_boot_searches(self) -> None:
+        legacy = (
+            ("rst-1", "rst_boots", "RST Boots", "RST", 40.0),
+            ("rst-2", "rst_boots", "RST Boots", "RST", 45.0),
+            (
+                "alpinestars-1",
+                "alpinestars_boots",
+                "Alpinestars Boots",
+                "Alpinestars",
+                50.0,
+            ),
+            (
+                "alpinestars-2",
+                "alpinestars_boots",
+                "Alpinestars Boots",
+                "Alpinestars",
+                55.0,
+            ),
+        )
+
+        for listing_id, search_id, search_name, brand, price in legacy:
+            self.add_sold(
+                listing_id,
+                search_id=search_id,
+                search_name=search_name,
+                brand=brand,
+                size="UK 9",
+                price=price,
+            )
+
+        listing = make_listing(
+            "new-richa",
+            search_id="motorcycle_boots",
+            search_name="Motorcycle Boots",
+            brand="Richa",
+            size="UK 7",
+            price=15.0,
+        )
+
+        analysis = self.scorer.analyse(listing)
+
+        assert analysis is not None
+        self.assertEqual(analysis.estimated_resale, 47.5)
+        self.assertEqual(analysis.comparable_count, 4)
+        self.assertEqual(analysis.scope, "family:motorcycle_boots")
+        self.assertEqual(analysis.confidence, "low")
+        self.assertIsNotNone(analysis.score)
+        self.assertLessEqual(analysis.score or 0, 59)
 
     def test_large_discount_produces_scored_opportunity(self) -> None:
         for index in range(12):
