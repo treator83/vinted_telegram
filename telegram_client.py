@@ -11,8 +11,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from config import BOT_TOKEN, CHAT_ID
+from config import BOT_TOKEN, CHAT_ID, DATABASE_PATH
 from models import Listing
+from opportunity import OpportunityAnalysis, OpportunityScorer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class TelegramClient:
         self,
         bot_token: str = BOT_TOKEN,
         chat_id: str | int = CHAT_ID,
+        opportunity_scorer: OpportunityScorer | None = None,
     ) -> None:
         self.bot_token = str(bot_token).strip()
         self.chat_id = str(chat_id).strip()
@@ -54,11 +56,20 @@ class TelegramClient:
 
         self._api = f"{TELEGRAM_API_URL}/bot{self.bot_token}"
         self._session = self._create_session()
+        self._opportunity_scorer = (
+            opportunity_scorer
+            if opportunity_scorer is not None
+            else OpportunityScorer(DATABASE_PATH)
+        )
 
     def send_listing(self, listing: Listing) -> bool:
         """Send a notification for a newly discovered listing."""
 
-        caption = self._build_listing_caption(listing)
+        analysis = self._analyse_opportunity(listing)
+        caption = self._build_listing_caption(
+            listing,
+            analysis,
+        )
 
         if listing.image and self._send_photo(listing.image, caption):
             LOGGER.info("Sent new-listing photo notification for %s", listing.id)
@@ -78,9 +89,11 @@ class TelegramClient:
     ) -> bool:
         """Send a notification when a listing price decreases."""
 
+        analysis = self._analyse_opportunity(listing)
         caption = self._build_price_drop_caption(
             listing=listing,
             old_price=old_price,
+            analysis=analysis,
         )
 
         if listing.image and self._send_photo(listing.image, caption):
@@ -109,6 +122,35 @@ class TelegramClient:
         traceback: object,
     ) -> None:
         self.close()
+
+    def _analyse_opportunity(
+        self,
+        listing: Listing,
+    ) -> OpportunityAnalysis | None:
+        try:
+            analysis = self._opportunity_scorer.analyse(listing)
+
+            if analysis is not None:
+                LOGGER.info(
+                    "OPPORTUNITY | %s | score=%s | estimate=%s | comps=%d | confidence=%s",
+                    listing.id,
+                    analysis.score if analysis.score is not None else "n/a",
+                    (
+                        f"£{analysis.estimated_resale:.2f}"
+                        if analysis.estimated_resale is not None
+                        else "n/a"
+                    ),
+                    analysis.comparable_count,
+                    analysis.confidence,
+                )
+
+            return analysis
+        except Exception:
+            LOGGER.exception(
+                "Unable to calculate opportunity score for %s",
+                listing.id,
+            )
+            return None
 
     def _send_photo(
         self,
@@ -242,12 +284,25 @@ class TelegramClient:
         return image_data, filename, content_type
 
     @staticmethod
-    def _build_listing_caption(listing: Listing) -> str:
+    def _build_listing_caption(
+        listing: Listing,
+        analysis: OpportunityAnalysis | None = None,
+    ) -> str:
         search_name = TelegramClient._display_value(listing.search_name)
         title = TelegramClient._display_value(listing.title)
         subtitle = TelegramClient._display_value(listing.subtitle)
         price = TelegramClient._display_value(listing.price)
         total_price = TelegramClient._display_value(listing.total_price)
+        opportunity = TelegramClient._opportunity_text(
+            analysis,
+            listing.price,
+        )
+
+        market_block = (
+            f"\n\n{opportunity}"
+            if opportunity
+            else ""
+        )
 
         return (
             "🏍 NEW LISTING\n\n"
@@ -255,7 +310,8 @@ class TelegramClient:
             f"Brand:\n{title}\n\n"
             f"Info:\n{subtitle}\n\n"
             f"Price:\n{price}\n\n"
-            f"Total:\n{total_price}\n\n"
+            f"Total:\n{total_price}"
+            f"{market_block}\n\n"
             f"{listing.url}"
         )
 
@@ -263,6 +319,7 @@ class TelegramClient:
     def _build_price_drop_caption(
         listing: Listing,
         old_price: float,
+        analysis: OpportunityAnalysis | None = None,
     ) -> str:
         saved = max(0.0, old_price - listing.price_value)
         currency = TelegramClient._currency_symbol(listing.price)
@@ -271,6 +328,16 @@ class TelegramClient:
         title = TelegramClient._display_value(listing.title)
         subtitle = TelegramClient._display_value(listing.subtitle)
         new_price = TelegramClient._display_value(listing.price)
+        opportunity = TelegramClient._opportunity_text(
+            analysis,
+            listing.price,
+        )
+
+        market_block = (
+            f"\n\n{opportunity}"
+            if opportunity
+            else ""
+        )
 
         return (
             "💰 PRICE DROP\n\n"
@@ -279,8 +346,79 @@ class TelegramClient:
             f"Info:\n{subtitle}\n\n"
             f"Old Price:\n{currency}{old_price:.2f}\n\n"
             f"New Price:\n{new_price}\n\n"
-            f"You Save:\n{currency}{saved:.2f}\n\n"
+            f"You Save:\n{currency}{saved:.2f}"
+            f"{market_block}\n\n"
             f"{listing.url}"
+        )
+
+    @staticmethod
+    def _opportunity_text(
+        analysis: OpportunityAnalysis | None,
+        price_text: str,
+    ) -> str:
+        if analysis is None:
+            return ""
+
+        currency = TelegramClient._currency_symbol(price_text)
+
+        if analysis.score is None:
+            if analysis.comparable_count == 0:
+                return "📊 Market data: building history"
+
+            estimate = (
+                f"{currency}{analysis.estimated_resale:.2f}"
+                if analysis.estimated_resale is not None
+                else "n/a"
+            )
+
+            return (
+                "📊 Market data: building confidence\n"
+                f"Est. resale: {estimate}\n"
+                f"Sold comps: {analysis.comparable_count}"
+            )
+
+        icons = {
+            "exceptional": "🔥",
+            "strong": "🔥",
+            "promising": "✅",
+            "normal": "👀",
+        }
+        icon = icons.get(analysis.label, "📊")
+
+        estimate = (
+            f"{currency}{analysis.estimated_resale:.2f}"
+            if analysis.estimated_resale is not None
+            else "n/a"
+        )
+        margin = (
+            f"{currency}{analysis.gross_margin:.2f}"
+            if analysis.gross_margin is not None
+            else "n/a"
+        )
+        roi = (
+            f"{analysis.roi_percent:.0f}%"
+            if analysis.roi_percent is not None
+            else "n/a"
+        )
+        sell_rate = (
+            f"{analysis.sell_through_rate:.0f}%"
+            if analysis.sell_through_rate is not None
+            else "n/a"
+        )
+        days = (
+            f"{analysis.average_days_to_sell:.1f}d"
+            if analysis.average_days_to_sell is not None
+            else "n/a"
+        )
+
+        return (
+            f"{icon} Opportunity: {analysis.score}/100 "
+            f"({analysis.label.upper()})\n"
+            f"Est. resale: {estimate}\n"
+            f"Gross spread: {margin} ({roi})\n"
+            f"Market: {analysis.comparable_count} sold comps · "
+            f"{sell_rate} sell-through · {days} avg\n"
+            f"Confidence: {analysis.confidence.upper()}"
         )
 
     @staticmethod
