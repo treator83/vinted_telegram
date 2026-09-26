@@ -1,23 +1,10 @@
 [
   {
-    "id": "rst_boots",
-    "name": "RST Boots",
-    "url": "https://www.vinted.co.uk/catalog?search_text=RST%20boots&order=newest_first&page=1",
-    "max_price": 40,
-    "keywords": [
-      "rst"
-    ],
-    "sizes": [],
-    "conditions": []
-  },
-  {
-    "id": "alpinestars_boots",
-    "name": "Alpinestars Boots",
-    "url": "https://www.vinted.co.uk/catalog?search_text=alpinestars%20boots&order=newest_first&page=1",
-    "max_price": 40,
-    "keywords": [
-      "alpinestars"
-    ],
+    "id": "motorcycle_boots",
+    "name": "Motorcycle Boots",
+    "url": "https://www.vinted.co.uk/catalog?search_text=motorbike%20boots&order=newest_first&page=1",
+    "max_price": 20,
+    "keywords": [],
     "sizes": [],
     "conditions": []
   },
