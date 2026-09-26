@@ -201,7 +201,7 @@ class HealthMonitorTests(unittest.TestCase):
             "Agent: active",
             "Commands: active",
             "Memory:",
-            "Chromium processes:",
+            "Chrome processes:",
             "Queue:",
             "Disk free:",
             "Telegram API: OK",
