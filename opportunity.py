@@ -15,6 +15,20 @@ from models import Listing
 MIN_COMPARABLES: Final[int] = 3
 MAX_COMPARABLES: Final[int] = 200
 
+# Current broad searches can inherit historical data collected under older,
+# narrower search IDs. This keeps previous observations useful after a search
+# configuration is consolidated or renamed.
+SEARCH_FAMILIES: Final[dict[str, tuple[str, ...]]] = {
+    "motorcycle_boots": (
+        "motorcycle_boots",
+        "rst_boots",
+        "alpinestars_boots",
+    ),
+    "climbing_shoes": (
+        "climbing_shoes",
+    ),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class OpportunityAnalysis:
@@ -135,7 +149,10 @@ class OpportunityScorer:
                 else None
             )
 
-            confidence = self._confidence(comparable_count)
+            confidence = self._confidence(
+                comparable_count,
+                scope,
+            )
 
             if comparable_count < MIN_COMPARABLES:
                 return OpportunityAnalysis(
@@ -158,6 +175,12 @@ class OpportunityScorer:
                 sell_through_rate=activity["sell_through_rate"],
                 average_days_to_sell=activity["average_days_to_sell"],
             )
+
+            # A broad search-family comparison is useful as a category
+            # baseline, but it is not specific enough to justify a strong or
+            # exceptional buying signal on its own.
+            if scope.label.startswith("family:"):
+                score = min(score, 59)
 
             return OpportunityAnalysis(
                 score=score,
@@ -203,8 +226,9 @@ class OpportunityScorer:
 
         return fallback_scope, fallback_rows
 
-    @staticmethod
+    @classmethod
     def _candidate_scopes(
+        cls,
         listing: Listing,
         search_id: str,
     ) -> list[_Scope]:
@@ -248,27 +272,47 @@ class OpportunityScorer:
                 )
             )
 
+        family_ids = cls._search_family(search_id)
+        family_sql = cls._family_sql(family_ids)
+
         if size:
             scopes.append(
                 _Scope(
-                    label=f"search+size:{search_id} / {size}",
+                    label=f"family+size:{search_id} / {size}",
                     where_sql=(
-                        "search_id = ? "
+                        f"{family_sql} "
                         "AND LOWER(TRIM(size)) = LOWER(TRIM(?))"
                     ),
-                    parameters=(search_id, size),
+                    parameters=(*family_ids, size),
                 )
             )
 
         scopes.append(
             _Scope(
-                label=f"search:{search_id}",
-                where_sql="search_id = ?",
-                parameters=(search_id,),
+                label=f"family:{search_id}",
+                where_sql=family_sql,
+                parameters=family_ids,
             )
         )
 
         return scopes
+
+    @staticmethod
+    def _search_family(search_id: str) -> tuple[str, ...]:
+        configured = SEARCH_FAMILIES.get(search_id)
+
+        if configured:
+            return configured
+
+        return (search_id,)
+
+    @staticmethod
+    def _family_sql(search_ids: tuple[str, ...]) -> str:
+        placeholders = ", ".join(
+            "?"
+            for _ in search_ids
+        )
+        return f"search_id IN ({placeholders})"
 
     @staticmethod
     def _sold_rows(
@@ -420,14 +464,28 @@ class OpportunityScorer:
         return max(0, min(100, score))
 
     @staticmethod
-    def _confidence(comparable_count: int) -> str:
+    def _confidence(
+        comparable_count: int,
+        scope: _Scope,
+    ) -> str:
+        if comparable_count < MIN_COMPARABLES:
+            return "insufficient"
+
+        # Broad family statistics are useful as a baseline but are not a
+        # substitute for same-brand or same-size comparables.
+        if scope.label.startswith("family:"):
+            return "low"
+
+        if scope.label.startswith("family+size:"):
+            if comparable_count >= 20:
+                return "medium"
+            return "low"
+
         if comparable_count >= 20:
             return "high"
         if comparable_count >= 8:
             return "medium"
-        if comparable_count >= MIN_COMPARABLES:
-            return "low"
-        return "insufficient"
+        return "low"
 
     @staticmethod
     def _label(score: int) -> str:
